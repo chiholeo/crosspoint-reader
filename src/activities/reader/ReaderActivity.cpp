@@ -11,6 +11,8 @@
 #include "Epub.h"
 #include "EpubReaderActivity.h"
 #include "SdCardFontSystem.h"
+#include "cjk/CjkReaderSettings.h"
+#include "cjk/CjkVerticalReaderActivity.h"
 #include "Txt.h"
 #include "TxtReaderActivity.h"
 #include "Xtc.h"
@@ -119,6 +121,16 @@ void ReaderActivity::goToLibrary(const std::string& fromBookPath) {
 void ReaderActivity::onGoToEpubReader(std::unique_ptr<Epub> epub) {
   const auto epubPath = epub->getPath();
   currentBookPath = epubPath;
+  // Opt-in CJK vertical reader: only takes over when explicitly enabled AND
+  // a font family is configured (there's no built-in CJK font to fall back
+  // on). Any other state -- disabled, or enabled with no font picked yet --
+  // falls through to the standard EpubReaderActivity untouched.
+  if (CJK_READER_SETTINGS.enabled && !CJK_READER_SETTINGS.fontFamilyName.empty()) {
+    activityManager.replaceActivity(std::make_unique<CjkVerticalReaderActivity>(renderer, mappedInput,
+                                                                                std::move(epub),
+                                                                                initialRefreshCountdown()));
+    return;
+  }
   activityManager.replaceActivity(
       std::make_unique<EpubReaderActivity>(renderer, mappedInput, std::move(epub), initialRefreshCountdown()));
 }

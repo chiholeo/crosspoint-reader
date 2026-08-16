@@ -22,6 +22,15 @@ class SdCardFontSystem {
   /// Also re-discovers if the registry has been marked dirty (e.g. by web upload).
   void ensureLoaded(GfxRenderer& renderer);
 
+  /// Unload the currently-active SD family. Used by callers that need the
+  /// shared font slot free for their own SdCardFontManager (e.g. the CJK
+  /// vertical reader loading its own font selection) -- font IDs are
+  /// content-hash based and global to the renderer, so loading the same
+  /// family+size twice while this system's copy is still registered fails
+  /// as an "ID collision", not a silent success. Call ensureLoaded() again
+  /// to restore the standard selection once the caller is done.
+  void unload(GfxRenderer& renderer) { manager_.unloadAll(renderer); }
+
   /// Resolve an SD card font ID from family name + reader point size.
   /// Returns 0 if not found. Used by CrossPointSettings::getReaderFontId().
   int resolveFontId(const char* familyName, uint8_t pointSize) const;

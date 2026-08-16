@@ -9,8 +9,13 @@
 
 namespace ProgressFile {
 
-// Writes `len` bytes of reader progress to `<cachePath>/progress.bin` without
-// ever leaving the canonical file half-written.
+// Writes `len` bytes of reader progress to `<cachePath>/<filename>` (default
+// "progress.bin", the standard reader's own file) without ever leaving the
+// canonical file half-written. Pass a different filename for a reader engine
+// that keeps its own progress format in the same book cache dir (e.g. the
+// CJK vertical reader) -- sharing "progress.bin" between two readers with
+// different on-disk formats would let switching between them on the same
+// book corrupt whichever one reads it next.
 //
 // The bytes go to a temporary `progress.bin.tmp` first; only once that is fully
 // written and closed is it renamed over progress.bin. An interrupted write
@@ -29,9 +34,10 @@ namespace ProgressFile {
 // fail at the FAT level, in which case recovery still requires fsck on a host.
 //
 // Returns true only if the new progress.bin is fully in place.
-inline bool writeAtomic(const std::string& cachePath, const uint8_t* data, size_t len) {
-  const std::string finalPath = cachePath + "/progress.bin";
-  const std::string tmpPath = cachePath + "/progress.bin.tmp";
+inline bool writeAtomic(const std::string& cachePath, const uint8_t* data, size_t len,
+                        const std::string& filename = "progress.bin") {
+  const std::string finalPath = cachePath + "/" + filename;
+  const std::string tmpPath = cachePath + "/" + filename + ".tmp";
 
   {
     HalFile f;
