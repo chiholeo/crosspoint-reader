@@ -7,7 +7,6 @@
 #include <Utf8.h>
 
 #include <algorithm>
-#include <cstdlib>
 
 #include "CjkChapterText.h"
 #include "CjkKinsoku.h"
@@ -35,6 +34,25 @@ int columnSpacingPx(const uint8_t spacing) {
       return 10;
   }
 }
+
+// Feeds chapter bytes into a ChapterTextExtractor as they stream in from
+// Epub::readItemContentsToStream, so loadChapter() never needs the whole
+// chapter's raw HTML in one contiguous buffer.
+class ChapterTextStreamSink final : public Print {
+  CjkChapterText::ChapterTextExtractor& extractor;
+
+ public:
+  explicit ChapterTextStreamSink(CjkChapterText::ChapterTextExtractor& extractor) : extractor(extractor) {}
+  size_t write(const uint8_t b) override {
+    const char c = static_cast<char>(b);
+    extractor.feed(&c, 1);
+    return 1;
+  }
+  size_t write(const uint8_t* buffer, const size_t size) override {
+    extractor.feed(reinterpret_cast<const char*>(buffer), size);
+    return size;
+  }
+};
 }  // namespace
 
 void CjkVerticalReaderActivity::onEnter() {
@@ -89,6 +107,19 @@ void CjkVerticalReaderActivity::onEnter() {
   }
   fontId = fontManager.getFontId(CJK_READER_SETTINGS.fontFamilyName);
 
+  // Deliberately NOT registering our font as the UI CJK fallback here
+  // anymore (an earlier round did). It fixed CJK titles showing as blank in
+  // the TOC list, but two separate on-device crash reports (abort(), full
+  // reboot) traced back to the exact same trigger: that fallback routes
+  // built-in-UI-font text through SdCardFont's 8-slot on-demand overflow
+  // ring, and a TOC screen with many unique CJK title characters bursts
+  // through it far harder than normal reading ever does -- a ~4-second
+  // render followed by abort() both times, even after prewarming the TOC
+  // text (see openChapterSelection()). That's a pre-existing fragility in
+  // shared font-fallback code, not something to keep patching blind from
+  // here. Reverting to no fallback: CJK-titled TOC entries show boxes
+  // again, but the reader doesn't reboot the device.
+
   int marginTop = 0;
   int marginRight = 0;
   int marginBottom = 0;
@@ -101,6 +132,18 @@ void CjkVerticalReaderActivity::onEnter() {
   viewportBottomY = renderer.getScreenHeight() - marginBottom -
                     std::max<int>(screenMargin, UITheme::getInstance().getStatusBarHeight());
 
+  // Uncompressed getLineHeight() -- a compressed step (an earlier attempt
+  // used 0.82x) shortens the space BETWEEN rows without shrinking the
+  // glyph BITMAPS drawn into them, so the last row's glyph can extend past
+  // its allotted step. For the very last row in a column that means past
+  // the viewport's bottom edge entirely: an on-device crash report showed
+  // "Outside range (x, 800) -> (800, y)" draw errors (logical Y=800 is one
+  // past this screen's actual height) right before an abort(), and a
+  // denser page from tighter spacing also means more unique glyphs
+  // competing for the same 8-slot on-demand overflow cache that caused
+  // every earlier TOC crash -- both real costs for a cosmetic tightening
+  // that isn't worth it until there's a safe way to verify a compressed
+  // value against real glyph metrics instead of guessing a fixed factor.
   const int cellSize = renderer.getLineHeight(fontId);
   glyphAdvancePx = std::max(cellSize, 1);
   columnWidthPx = glyphAdvancePx + columnSpacingPx(CJK_READER_SETTINGS.columnSpacing);
@@ -110,7 +153,12 @@ void CjkVerticalReaderActivity::onEnter() {
 
   Progress resume;
   const bool hasResume = loadProgress(resume);
-  const int startSpine = hasResume ? resume.spineIndex : 0;
+  // No saved position: start at the EPUB's declared text-reference spine
+  // item, not spine[0]. Spine[0] is very often a cover or nav/TOC document,
+  // not the first real chapter -- without this a fresh open renders the
+  // nav document's own link list as if it were chapter body text. Mirrors
+  // EpubReaderActivity's exact same fallback for the same reason.
+  const int startSpine = hasResume ? resume.spineIndex : epub->getSpineIndexForTextReference();
   if (loadChapter(startSpine)) {
     if (hasResume) seekToByteOffset(resume.byteOffset);
   } else if (startSpine != 0 && loadChapter(0)) {
@@ -144,34 +192,127 @@ void CjkVerticalReaderActivity::onExit() {
 }
 
 bool CjkVerticalReaderActivity::loadChapter(const int spineIndex) {
-  if (!epub || spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) return false;
-
-  const auto spineItem = epub->getSpineItem(spineIndex);
-  size_t size = 0;
-  uint8_t* bytes = epub->readItemContentsToBytes(spineItem.href, &size, true);
-  if (!bytes) {
-    LOG_ERR("CJKR", "Failed to read chapter %d (%s)", spineIndex, spineItem.href.c_str());
+  if (!epub || spineIndex < 0 || spineIndex >= epub->getSpineItemsCount()) {
+    lastLoadErrorDetail = "invalid spine index";
     return false;
   }
-  chapterText = CjkChapterText::extractPlainText(reinterpret_cast<const char*>(bytes), size);
-  free(bytes);
 
-  currentSpineIndex = spineIndex;
-  currentPage = 0;
+  // Wait for any in-progress render to fully finish before touching the SD
+  // card at all -- purely a synchronization wait, released immediately, not
+  // held across the I/O below (that would violate
+  // docs/activity-manager.md's "don't hold RenderLock across blocking
+  // calls" rule the other way). requestUpdate(false) (used throughout this
+  // reader) only queues a flag; it does not wait for the render task to
+  // actually run. Without this wait, the render task can still be mid-page,
+  // doing its own SD reads for on-demand glyph loads (SdCardFont's overflow
+  // path), while this function starts a second, concurrent SD read for the
+  // next chapter on the main task. A crash report from testing this exact
+  // sequence -- an overflow-heavy page still loading glyphs, "before
+  // loadChapter" firing while that was in progress, an abort() shortly
+  // after -- matches two tasks racing the SD card, not a single-task bug.
+  { RenderLock waitForRenderIdle(*this); }
 
-  // Prewarm the whole chapter's SD glyphs in one batch rather than letting
-  // per-page rendering trigger the expensive per-glyph SD-miss path
-  // repeatedly (see add_CJKreader.md).
-  if (fontId != 0) {
-    renderer.ensureSdCardFontReady(fontId, chapterText.c_str());
+  const auto spineItem = epub->getSpineItem(spineIndex);
+  if (spineItem.href.empty()) {
+    lastLoadErrorDetail = "spine item has no href";
+    return false;
   }
 
-  rebuildPageIndexForCurrentChapter();
-  return true;
-}
+  // Release the outgoing chapter's memory before reading the next one, so
+  // its heap block is free (and available for coalescing) instead of sitting
+  // resident alongside the new chapter while it's being built. Confirmed via
+  // addr2line against a real on-device abort() that this matters: the actual
+  // crash was std::bad_alloc from CjkChapterText::ChapterTextExtractor's
+  // output string failing to grow mid-stream (basic_string::_M_mutate ->
+  // operator new -> bad_alloc -> terminate, no exception handler in this
+  // build) -- a genuine allocation failure on a fragmented heap, not the
+  // race this function's RenderLock wait above addresses.
+  {
+    RenderLock lock(*this);
+    chapterText.clear();
+    chapterText.shrink_to_fit();
+    pageIndex.clear();
+    pageIndex.shrink_to_fit();
+  }
 
-void CjkVerticalReaderActivity::rebuildPageIndexForCurrentChapter() {
-  pageIndex = CjkVerticalLayout::buildPageIndex(chapterText, metrics, CJK_READER_SETTINGS.kinsokuEnabled);
+  // Streamed, not epub->readItemContentsToBytes(): that reads the whole
+  // chapter's raw HTML into one contiguous buffer up front. On-device
+  // testing found real chapters whose raw HTML read fails even with 100+ KB
+  // of *total* free heap and a comparable largest-free-block -- the raw
+  // HTML itself was apparently larger than any single available block.
+  // Streaming through ChapterTextExtractor chunk-by-chunk means the only
+  // sizeable buffer needed is the extracted plain text (tags/attributes
+  // stripped out), which is smaller than the raw markup it came from.
+  CjkChapterText::ChapterTextExtractor extractor;
+
+  // Reserve the output string's capacity up front from the item's known raw
+  // size (plain text is always <= raw HTML) so growth never has to
+  // reallocate mid-stream -- each reallocation needs a fresh contiguous
+  // block, and repeatedly doubling into ever-larger blocks is exactly what
+  // was failing under heap fragmentation (max-alloc well below total free
+  // heap in every crash report so far). One sized reservation up front, and
+  // if even that can't be satisfied, fail cleanly before any partial state
+  // is built instead of aborting mid-extraction.
+  size_t itemSize = 0;
+  if (epub->getItemSize(spineItem.href, &itemSize) && itemSize > 0) {
+    if (itemSize > ESP.getMaxAllocHeap()) {
+      char detail[96];
+      snprintf(detail, sizeof(detail), "chapter too large for available heap: %u > max-alloc %u (%s)",
+                static_cast<unsigned>(itemSize), static_cast<unsigned>(ESP.getMaxAllocHeap()), spineItem.href.c_str());
+      lastLoadErrorDetail = detail;
+      LOG_ERR("CJKR", "%s", detail);
+      return false;
+    }
+    extractor.reserveCapacity(itemSize);
+  }
+
+  ChapterTextStreamSink sink(extractor);
+  constexpr size_t kStreamChunkSize = 4096;
+  if (!epub->readItemContentsToStream(spineItem.href, sink, kStreamChunkSize, false)) {
+    char detail[80];
+    snprintf(detail, sizeof(detail), "readItemContentsToStream failed: %s", spineItem.href.c_str());
+    lastLoadErrorDetail = detail;
+    LOG_ERR("CJKR", "Failed to stream chapter %d (%s)", spineIndex, spineItem.href.c_str());
+    return false;
+  }
+  // Build into a local -- unlocked, matching docs/activity-manager.md's
+  // "acquire, mutate, release, then blocking work" ordering (in reverse:
+  // blocking work first here, since there's no pre-existing state to show
+  // mid-build).
+  std::string newChapterText = extractor.finish();
+
+  // NOT prewarming the whole chapter here (the original plan's "prewarm per
+  // chapter, not per page" idea) -- SdCardFont's mini glyph cache is
+  // deliberately "kept, not freed" across prewarms so repeat pages don't
+  // re-pay SD reads, which means prewarming a full chapter's unique-glyph
+  // set makes that resident cache grow to fit the LARGEST chapter seen this
+  // session and never shrinks back down on its own. renderPage() prewarms
+  // one page's text at a time instead -- a bounded, small working set.
+  std::vector<size_t> newPageIndex =
+      CjkVerticalLayout::buildPageIndex(newChapterText, metrics, CJK_READER_SETTINGS.kinsokuEnabled);
+
+  // Commit under a RenderLock. ActivityManager runs render() on a separate
+  // task from loop()/result handlers, and this reader has no synchronization
+  // on chapterText/pageIndex/currentPage/currentSpineIndex beyond this lock
+  // -- an unprotected reassignment here is exactly the "modifying shared
+  // state without RenderLock" pitfall docs/activity-manager.md calls out:
+  // the render task can read a std::string or std::vector mid-reassignment,
+  // which is undefined behavior. That was the actual cause of a real
+  // on-device abort()/reboot selecting a chapter from the TOC screen --
+  // confirmed by resolving the panic PC against the local build with
+  // addr2line: it lands in libstdc++'s exception-termination path
+  // (__cxa_init_primary_exception / __cxxabiv1::__terminate), consistent
+  // with a torn string/vector read triggering something like
+  // std::out_of_range with no reachable handler, not a heap-capacity issue
+  // (the crash reproduced with heap free/fragmentation both healthy).
+  {
+    RenderLock lock(*this);
+    chapterText = std::move(newChapterText);
+    pageIndex = std::move(newPageIndex);
+    currentSpineIndex = spineIndex;
+    currentPage = 0;
+  }
+  return true;
 }
 
 void CjkVerticalReaderActivity::seekToByteOffset(const uint32_t byteOffset) {
@@ -220,18 +361,52 @@ void CjkVerticalReaderActivity::saveProgress() const {
   }
 }
 
+// Not currently reachable from input (see the Confirm-button comment in
+// loop()) -- kept intact, with heap logging added at each stage, so that if
+// TOC selection is revisited, the crash it's caused three times so far
+// (two causes fixed and confirmed; a third, __cxxabiv1::__unexpected with
+// an unclear trigger from a raw/unsymbolized stack dump, isn't) can be
+// pinned down from a serial log or crash report instead of guessed at again.
 void CjkVerticalReaderActivity::openChapterSelection() {
   const int spineAtOpen = currentSpineIndex;
   const std::string path = epub->getPath();
+
+  LOG_DBG("CJKR", "openChapterSelection: heap free=%u max-alloc=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+          static_cast<unsigned>(ESP.getMaxAllocHeap()));
+
   startActivityForResult(
       std::make_unique<EpubReaderChapterSelectionActivity>(renderer, mappedInput, epub, path, spineAtOpen),
       [this](const ActivityResult& result) {
+        LOG_DBG("CJKR", "chapter selection result handler entered: heap free=%u max-alloc=%u",
+                static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
         if (result.isCancelled) return;
-        const auto& chapterResult = std::get<ChapterResult>(result.data);
-        RenderLock lock(*this);
-        if (chapterResult.spineIndex != currentSpineIndex) {
-          loadChapter(chapterResult.spineIndex);
+        // get_if, not get: this firmware builds with -fno-exceptions, so a
+        // std::get mismatch (result.data not actually holding ChapterResult)
+        // would call std::terminate() and abort instead of throwing --
+        // exactly the kind of "select a chapter and it crashes" symptom
+        // that's silent without a serial log. Fail soft instead.
+        const auto* chapterResult = std::get_if<ChapterResult>(&result.data);
+        if (!chapterResult) {
+          LOG_ERR("CJKR", "Chapter selection returned an unexpected result type");
+          return;
         }
+        const int targetSpine = chapterResult->spineIndex;
+        LOG_DBG("CJKR", "before loadChapter(%d): heap free=%u max-alloc=%u", targetSpine,
+                static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
+        // loadChapter() takes its own RenderLock internally, only around the
+        // final state commit -- the SD read and string/vector build happen
+        // unlocked before that, so nothing extra is needed at this call site.
+        if (targetSpine != currentSpineIndex && !loadChapter(targetSpine)) {
+          char buf[160];
+          snprintf(buf, sizeof(buf), "Chapter load failed: spine %d->%d (%s)", currentSpineIndex, targetSpine,
+                   lastLoadErrorDetail.c_str());
+          LOG_ERR("CJKR", "%s", buf);
+          RenderLock lock(*this);
+          loadFailed = true;
+          loadFailMessage = buf;
+        }
+        LOG_DBG("CJKR", "after loadChapter: heap free=%u max-alloc=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+                static_cast<unsigned>(ESP.getMaxAllocHeap()));
         requestUpdate();
       });
 }
@@ -251,10 +426,17 @@ void CjkVerticalReaderActivity::loop() {
     return;
   }
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-    openChapterSelection();
-    return;
-  }
+  // Confirm -> openChapterSelection() is deliberately disconnected for now.
+  // TOC selection has crashed the device on three separate underlying
+  // causes this session; two are fixed and confirmed (a RenderLock data
+  // race, and a large-chapter allocation failure), but a third
+  // (__cxxabiv1::__unexpected, unclear exact trigger from a raw/unsymbolized
+  // stack dump) remains unresolved. Rather than keep iterating blind against
+  // reboots, the core reading path (page turns, chapter advance, resume) is
+  // left solid and this entry point stays unreachable until it's properly
+  // diagnosed -- see openChapterSelection()'s own comments for the heap
+  // logging added to make the next investigation faster, if/when this is
+  // revisited.
 
   const auto touch = ReaderUtils::detectTouchPageTurn(renderer, mappedInput);
   auto [prevTriggered, nextTriggered, fromTilt] = ReaderUtils::detectPageTurn(mappedInput);
@@ -264,21 +446,57 @@ void CjkVerticalReaderActivity::loop() {
 
   const int totalPages = std::max<int>(1, static_cast<int>(pageIndex.size()) - 1);
 
+  // A failed cross-chapter loadChapter() used to leave the reader frozen on
+  // the last/first page with zero feedback -- "press next, nothing happens,
+  // forever". Surface it as the same visible failure state onEnter() uses
+  // instead of silently doing nothing, so a persistent failure is at least
+  // reportable (LOG_ERR still fires for serial-log cases; this covers the
+  // "no serial access" case, which is every real-device test so far).
+  const auto failToLoadChapter = [this](const int targetSpine) {
+    // Put the actual diagnosis on screen, not the generic "check font"
+    // message -- that message is accurate for onEnter()'s font-load
+    // failures but actively misleading here (this is a mid-book chapter
+    // read failure, unrelated to font setup), and there's no serial-log
+    // access on real-device testing to fall back on.
+    char buf[160];
+    snprintf(buf, sizeof(buf), "Chapter load failed: spine %d->%d (%s), heap free=%u max-alloc=%u", currentSpineIndex,
+             targetSpine, lastLoadErrorDetail.c_str(), static_cast<unsigned>(ESP.getFreeHeap()),
+             static_cast<unsigned>(ESP.getMaxAllocHeap()));
+    LOG_ERR("CJKR", "%s", buf);
+    loadFailed = true;
+    loadFailMessage = buf;
+    requestUpdate();
+  };
+
   if (prevTriggered) {
     if (currentPage > 0) {
       currentPage--;
       requestUpdate();
-    } else if (currentSpineIndex > 0 && loadChapter(currentSpineIndex - 1)) {
-      const int newTotalPages = std::max<int>(1, static_cast<int>(pageIndex.size()) - 1);
-      currentPage = newTotalPages - 1;
-      requestUpdate();
+    } else if (currentSpineIndex > 0) {
+      const int target = currentSpineIndex - 1;
+      LOG_DBG("CJKR", "page-turn prev: before loadChapter(%d), heap free=%u max-alloc=%u", target,
+              static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
+      if (loadChapter(target)) {
+        const int newTotalPages = std::max<int>(1, static_cast<int>(pageIndex.size()) - 1);
+        currentPage = newTotalPages - 1;
+        requestUpdate();
+      } else {
+        failToLoadChapter(target);
+      }
     }
   } else if (nextTriggered) {
     if (currentPage < totalPages - 1) {
       currentPage++;
       requestUpdate();
     } else if (currentSpineIndex + 1 < epub->getSpineItemsCount()) {
-      if (loadChapter(currentSpineIndex + 1)) requestUpdate();
+      const int target = currentSpineIndex + 1;
+      LOG_DBG("CJKR", "page-turn next: before loadChapter(%d), heap free=%u max-alloc=%u", target,
+              static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
+      if (loadChapter(target)) {
+        requestUpdate();
+      } else {
+        failToLoadChapter(target);
+      }
     } else {
       onGoHome();
     }
@@ -289,8 +507,19 @@ void CjkVerticalReaderActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
   if (loadFailed || !initialized || pageIndex.size() < 2) {
+    // Wrapped, multi-line -- a single drawCenteredText call doesn't wrap,
+    // so the diagnostic messages built in loop() (which include live heap
+    // numbers) were running off the screen edge with no indication they'd
+    // been cut off.
     const std::string message = loadFailed && !loadFailMessage.empty() ? loadFailMessage : tr(STR_CJK_LOAD_FAILED);
-    renderer.drawCenteredText(UI_12_FONT_ID, renderer.getScreenHeight() / 2, message.c_str());
+    const int contentWidth = renderer.getScreenWidth() - 2 * UITheme::getInstance().getMetrics().contentSidePadding;
+    const auto lines = renderer.wrappedText(UI_12_FONT_ID, message.c_str(), contentWidth, 8);
+    const int lineHeight = renderer.getLineHeight(UI_12_FONT_ID);
+    int y = renderer.getScreenHeight() / 2 - static_cast<int>(lines.size()) * lineHeight / 2;
+    for (const auto& line : lines) {
+      renderer.drawCenteredText(UI_12_FONT_ID, y, line.c_str());
+      y += lineHeight;
+    }
     renderer.displayBuffer();
     return;
   }
@@ -305,6 +534,15 @@ void CjkVerticalReaderActivity::render(RenderLock&&) {
 void CjkVerticalReaderActivity::renderPage() const {
   const size_t pageStart = pageIndex[currentPage];
   const size_t pageEnd = pageIndex[currentPage + 1];
+
+  // Prewarm just this page's glyphs (see loadChapter()'s comment on why not
+  // the whole chapter). Cheap even on a revisit: SdCardFont keeps resident
+  // data it already has, so this is a fast no-op SD-wise for pages already
+  // seen this session.
+  if (fontId != 0 && pageEnd > pageStart) {
+    const std::string pageText = chapterText.substr(pageStart, pageEnd - pageStart);
+    renderer.ensureSdCardFontReady(fontId, pageText.c_str());
+  }
 
   int columnIndex = 0;
   size_t columnStart = pageStart;
@@ -336,12 +574,10 @@ void CjkVerticalReaderActivity::renderPage() const {
       const int y = viewportTopY + row * glyphAdvancePx;
 
       if (CjkKinsoku::isRotatedPunctuation(cp)) {
-        // drawTextRotated90CW renders upward from the given y (y is the
-        // bottom end of the run, unlike drawText's top-anchored y) -- see
-        // FreeInkUIGfxRenderer.h's usage comment. Anchor at this cell's
-        // bottom edge so the rotated glyph fills the same [y, y+glyphAdvancePx)
-        // span an unrotated glyph in this row would.
-        renderer.drawTextRotated90CW(fontId, columnX, y + glyphAdvancePx, glyphUtf8.c_str());
+        // Cell is [columnX, columnX+glyphAdvancePx) x [y, y+glyphAdvancePx)
+        // -- the same fixed step every other glyph in this column uses;
+        // drawGlyphRotated90CCW centers the rotated ink within it.
+        renderer.drawGlyphRotated90CCW(fontId, cp, columnX, y, glyphAdvancePx);
       } else {
         int8_t dx = 0;
         int8_t dy = 0;

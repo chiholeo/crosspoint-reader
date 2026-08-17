@@ -43,6 +43,12 @@ class CjkVerticalReaderActivity final : public Activity {
   std::string chapterText;
   std::vector<size_t> pageIndex;  // byte offsets; pageIndex[i]..pageIndex[i+1] is page i
   int currentPage = 0;
+  // Set by loadChapter() on failure (href + byte size it was reading, or
+  // "no href"/"not readable" for the failure before a read is even
+  // attempted) so callers can put an actual reason on screen -- there's no
+  // serial-log access on real-device testing, and "heap free/max-alloc"
+  // alone turned out not to explain a real, content-specific failure.
+  std::string lastLoadErrorDetail;
   int pagesUntilFullRefresh = 0;
   bool initialized = false;
   bool loadFailed = false;
@@ -65,7 +71,6 @@ class CjkVerticalReaderActivity final : public Activity {
   CjkVerticalLayout::PageMetrics metrics{};
 
   bool loadChapter(int spineIndex);
-  void rebuildPageIndexForCurrentChapter();
   void renderPage() const;
   void renderStatusBar() const;
   void openChapterSelection();

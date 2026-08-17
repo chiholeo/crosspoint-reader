@@ -271,6 +271,18 @@ class GfxRenderer {
   // Helper for drawing rotated text (90 degrees clockwise, for side buttons)
   void drawTextRotated90CW(int fontId, int x, int y, const char* text, bool black = true,
                            EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
+  // Single glyph, rotated the opposite way from drawTextRotated90CW -- for
+  // CJK vertical-text bracket/quote punctuation, which needs the true
+  // visual-clockwise rotation (see TextRotation::Rotated90CCW in
+  // GfxRenderer.cpp for why drawTextRotated90CW's actual pixel math is the
+  // other direction despite its name). (cellX, cellY, cellSize) is the
+  // fixed-size square cell the caller has allotted this character (matching
+  // its column-layout step); the glyph's rotated ink is centered within it
+  // rather than anchored at the raw top-left, since CJK punctuation glyphs
+  // often have much less ink than their advance box and a top-left anchor
+  // left a visible, glyph-dependent gap before the next character.
+  void drawGlyphRotated90CCW(int fontId, uint32_t codepoint, int cellX, int cellY, int cellSize, bool black = true,
+                             EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
   int getTextHeight(int fontId) const;
 
   // Grayscale functions

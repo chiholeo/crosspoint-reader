@@ -298,7 +298,16 @@ static AlignedMemRect screenRectToAlignedMemRect(GfxRenderer::Orientation orient
   return out;
 }
 
-enum class TextRotation { None, Rotated90CW };
+// Rotated90CCW: added for CJK vertical-text bracket/quote glyphs (see
+// GfxRenderer::drawGlyphRotated90CCW). Traced from Rotated90CW's own pixel
+// math: for Rotated90CW, a point originally to the glyph-local right of the
+// origin lands ABOVE the origin on screen, and a point originally below the
+// origin lands to its RIGHT -- that is a visual 90-degree COUNTERCLOCKWISE
+// rotation regardless of the enumerator's name (glyph-local right -> screen
+// up is a CCW turn: 3 o'clock to 12 o'clock the short way). This case
+// mirrors both sign flips to produce the true opposite (visual clockwise):
+// glyph-local right -> screen DOWN, glyph-local below -> screen LEFT.
+enum class TextRotation { None, Rotated90CW, Rotated90CCW };
 
 // Shared glyph rendering logic for normal and rotated text.
 // Coordinate mapping and cursor advance direction are selected at compile time via the template parameter.
@@ -402,6 +411,13 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
     if (!renderer.glyphIntersectsStrip(ob, ib - (width - 1), ob + height - 1, ib)) {
       return;
     }
+  } else if constexpr (rotation == TextRotation::Rotated90CCW) {
+    // (cursorX, cursorY) is the top-left corner of the rotated bounding box
+    // directly -- see the outerBase/innerBase comment below for why this
+    // doesn't reuse Rotated90CW's ascender/left/top-relative anchor.
+    if (!renderer.glyphIntersectsStrip(cursorX, cursorY, cursorX + height - 1, cursorY + width - 1)) {
+      return;
+    }
   } else {
     const int gx0 = cursorX + left;
     const int gy0 = cursorY - top;
@@ -419,6 +435,19 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
     if constexpr (rotation == TextRotation::Rotated90CW) {
       outerBase = cursorX + fontData->ascender - top;  // screenX = outerBase + glyphY
       innerBase = cursorY - left;                      // screenY = innerBase - glyphX
+    } else if constexpr (rotation == TextRotation::Rotated90CCW) {
+      // Deliberately NOT Rotated90CW's ascender/left/top-relative anchor:
+      // that's tuned for aligning a BASELINE across multiple differently-
+      // shaped glyphs in one run (kerned, advanced along it). Each call here
+      // draws exactly one glyph independently placed in its own cell (the
+      // CJK vertical reader's per-character column layout), so what's
+      // wanted is a plain top-left bounding-box anchor -- (cursorX, cursorY)
+      // is where the rotated glyph's screen bounding box starts, full stop.
+      // Reusing the ascender-relative anchor here previously offset every
+      // glyph by a different, glyph-dependent amount (ascender - top varies
+      // per glyph), which read as "shifted and overlapping neighbors".
+      outerBase = cursorX + height - 1;  // screenX = outerBase - glyphY, ranges [cursorX, cursorX+height-1]
+      innerBase = cursorY;               // screenY = innerBase + glyphX, ranges [cursorY, cursorY+width-1]
     } else {
       outerBase = cursorY - top;   // screenY = outerBase + glyphY
       innerBase = cursorX + left;  // screenX = innerBase + glyphX
@@ -433,6 +462,9 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
           if constexpr (rotation == TextRotation::Rotated90CW) {
             screenX = outerCoord;
             screenY = innerBase - glyphX;
+          } else if constexpr (rotation == TextRotation::Rotated90CCW) {
+            screenX = outerBase - glyphY;
+            screenY = innerBase + glyphX;
           } else {
             screenX = innerBase + glyphX;
             screenY = outerCoord;
@@ -468,6 +500,9 @@ static void renderCharImpl(const GfxRenderer& renderer, GfxRenderer::RenderMode 
           if constexpr (rotation == TextRotation::Rotated90CW) {
             screenX = outerCoord;
             screenY = innerBase - glyphX;
+          } else if constexpr (rotation == TextRotation::Rotated90CCW) {
+            screenX = outerBase - glyphY;
+            screenY = innerBase + glyphX;
           } else {
             screenX = innerBase + glyphX;
             screenY = outerCoord;
@@ -2042,6 +2077,36 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
     renderCharImpl<TextRotation::Rotated90CW>(*this, renderMode, font, cp, x, lastBaseY, black, style);
     prevCp = cp;
   }
+}
+
+void GfxRenderer::drawGlyphRotated90CCW(const int fontId, const uint32_t codepoint, const int cellX, const int cellY,
+                                        const int cellSize, const bool black, const EpdFontFamily::Style style) const {
+  // Single-glyph counterpart to drawTextRotated90CW, for callers placing one
+  // already-positioned character at a time (e.g. the CJK vertical reader's
+  // per-glyph column layout) rather than a laid-out run -- no advance,
+  // kerning, ligature, or CJK-fallback-font resolution needed, since the
+  // caller already knows fontId can draw this exact codepoint (it came from
+  // that font's own selected book text). See TextRotation::Rotated90CCW's
+  // declaration for why this is the opposite rotation from
+  // drawTextRotated90CW despite the "CW" in that function's name.
+  const auto fontIt = fontMap.find(fontId);
+  if (fontIt == fontMap.end()) {
+    LOG_ERR("GFX", "Font %d not found", fontId);
+    return;
+  }
+  const auto& font = fontIt->second;
+
+  // Plain top-left anchor (cellX, cellY) -- NOT centered on the glyph's own
+  // ink bounding box. An earlier attempt centered on (glyph->height,
+  // glyph->width) on the theory that CJK punctuation typically has much
+  // less ink than its advance box; on-device testing showed the opposite of
+  // what that theory predicted -- top-left anchoring was already correct
+  // for nearly every rotated glyph, and centering shifted all of them
+  // except U+300C ("「") to the right. So top-left is the real default;
+  // U+300C specifically still reads shifted under it and may need its own
+  // small correction once there's a reliable way to verify one on-device.
+  (void)cellSize;
+  renderCharImpl<TextRotation::Rotated90CCW>(*this, renderMode, font, codepoint, cellX, cellY, black, style);
 }
 
 uint8_t* GfxRenderer::getFrameBuffer() const { return frameBuffer; }
