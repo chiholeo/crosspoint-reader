@@ -1,4 +1,6 @@
 #pragma once
+#include <HalStorage.h>
+
 #include <string>
 
 // Minimal HTML-to-plain-text extraction for the CJK vertical reader.
@@ -14,39 +16,69 @@ namespace CjkChapterText {
 // Incremental extractor: feed() raw HTML bytes as they arrive from a
 // streamed SD/zip read (Epub::readItemContentsToStream), rather than
 // requiring the whole chapter's raw HTML in one contiguous buffer first.
-// On-device testing found chapters whose raw HTML exceeds the largest free
-// heap block even when total free heap is healthy -- reading the whole
-// chapter into one buffer before stripping it down means paying that
-// buffer's peak size for the LARGER raw-markup form, when the actual output
-// (plain text, tags/attributes stripped) is usually meaningfully smaller.
-// Streaming avoids ever holding more than one chunk of raw HTML plus the
-// growing output string.
+//
+// Output is written to an SD file through a small fixed-size buffer, not
+// accumulated in RAM at all (compare: an earlier version tried a std::string,
+// then a custom RAM-resident chunked buffer with a dynamically-sized,
+// adaptively-shrinking chunk -- both eventually traced back to genuine total
+// heap exhaustion on-device, not an allocation-strategy bug: the zip/inflate
+// stream's own fixed ~44KB decompressor state+window (see
+// lib/miniz/src/InflateStream.h) plus a large chapter's extracted text left
+// nothing in reserve, however efficiently that text's bytes were packed).
+// Writing straight to disk through a small bounded buffer makes this
+// extractor's own RAM usage O(1) in chapter size, independent of how large
+// the chapter's plain text turns out to be. See CjkChapterFileReader for the
+// read-back side used by pagination and rendering.
 class ChapterTextExtractor {
  public:
+  // Opens (creates/truncates) `path` as the output file. Must succeed
+  // before feed() is called -- feed() is a silent no-op (ioError() latches
+  // true) if it wasn't. `path`'s parent directory must already exist.
+  bool beginWrite(const std::string& path);
+
   // Feed the next chunk of raw HTML bytes. Chunks do not need to align with
   // tag or entity boundaries -- an incomplete "<...", "&...;" span at the
   // end of a chunk is carried over (bounded) and resolved once the rest
   // arrives in a later feed() call.
   void feed(const char* data, size_t len);
 
-  // Optional: reserve capacity for the output text up front (e.g. from the
-  // source item's known raw byte size) so feed() never needs a mid-stream
-  // reallocation. Plain text is always <= raw HTML size, so reserving the
-  // raw size guarantees this. Safe to skip; feed() grows `out` on demand
-  // either way.
-  void reserveCapacity(size_t n) { out.reserve(n); }
+  // True if beginWrite() failed, or a write to the output file failed
+  // partway through (SD full/removed/etc. -- distinct from the old
+  // allocation-failure OOM path, which no longer applies here).
+  bool ioError() const { return ioError_; }
+
+  size_t bytesWrittenSoFar() const { return totalBytes; }
 
   // Call once after the last feed(). Flushes any still-pending partial
   // token (tolerated as literal text -- true truncation mid-tag/entity is
-  // rare and not worth failing the whole chapter over) and returns the
-  // accumulated plain text.
-  std::string finish();
+  // rare and not worth failing the whole chapter over) and the write
+  // buffer, then closes the output file. Returns the total number of plain
+  // text bytes written (0 if ioError()).
+  size_t finish();
 
  private:
-  std::string out;
+  HalFile file;
+  static constexpr size_t kWriteBufSize = 2048;
+  char writeBuf[kWriteBufSize];
+  size_t writeBufLen = 0;
+  size_t totalBytes = 0;
+  bool ioError_ = false;
+
   bool lastWasSpace = true;   // suppresses a leading/duplicate space or paragraph separator
   std::string skipUntilTag;   // non-empty while inside <script>/<style>/<head>, persists across feed() calls
   std::string pending;        // carries an incomplete '<'/'&' span into the next feed() call
+  // A trimmable space or paragraph separator seen but not yet written --
+  // deferred until real text follows it (appendChar/appendStr flush this
+  // first), so a run that turns out to be trailing (nothing more follows
+  // before finish()) is simply never written, instead of being written
+  // optimistically and needing the file truncated afterward.
+  std::string pendingTrim;
+
+  // Flushes writeBuf to `file`. Sets ioError_ and returns false on a short
+  // write; writeBuf is reset to empty either way.
+  bool flushBuf();
+  void appendChar(char c);
+  void appendStr(const char* s);
 
   // Processes html[0, htmlLen); on hitting an unresolved '<' or '&' span
   // that doesn't close within this call's data, stashes the remainder into
@@ -54,9 +86,5 @@ class ChapterTextExtractor {
   // emitted as literal text instead).
   void processChunk(const char* html, size_t htmlLen, bool flush);
 };
-
-// One-shot convenience wrapper for callers that already have the whole
-// chapter in memory. Equivalent to a single feed() + finish().
-std::string extractPlainText(const char* html, size_t htmlLen);
 
 }  // namespace CjkChapterText

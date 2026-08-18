@@ -1,12 +1,10 @@
 #include "CjkChapterText.h"
 
 #include <Epub/htmlEntities.h>
-#include <Utf8.h>
+#include <Esp.h>
 
 #include <algorithm>
 #include <cctype>
-
-#include "CjkVerticalLayout.h"
 
 namespace {
 bool isAsciiSpace(const char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
@@ -28,45 +26,100 @@ bool isBlockTag(const std::string& name) {
 // entity. Real XHTML tags/entities are always far shorter than this --
 // this exists purely so malformed/truncated content (a stray unmatched '<'
 // with no '>' anywhere in the rest of the chapter) can't make `pending`
-// grow to hold the whole remaining chapter, which would recreate the exact
-// single-large-buffer problem streaming was added to avoid.
+// grow unboundedly.
 constexpr size_t kMaxPendingSpan = 4096;
+
+// PARAGRAPH_SEPARATOR (U+2029)'s UTF-8 encoding -- a fixed, known codepoint,
+// so this is hardcoded rather than needing a generic codepoint encoder.
+constexpr char kParagraphSeparatorUtf8[3] = {static_cast<char>(0xE2), static_cast<char>(0x80),
+                                             static_cast<char>(0xA9)};
 }  // namespace
 
 namespace CjkChapterText {
 
+bool ChapterTextExtractor::beginWrite(const std::string& path) {
+  file = Storage.open(path.c_str(), O_WRITE | O_CREAT | O_TRUNC);
+  if (!file) {
+    ioError_ = true;
+    return false;
+  }
+  return true;
+}
+
+bool ChapterTextExtractor::flushBuf() {
+  if (writeBufLen == 0) return true;
+  const size_t written = file.write(writeBuf, writeBufLen);
+  const bool ok = written == writeBufLen;
+  if (!ok) ioError_ = true;
+  writeBufLen = 0;
+  return ok;
+}
+
+void ChapterTextExtractor::appendChar(const char c) {
+  if (ioError_) return;
+  if (!pendingTrim.empty()) {
+    for (const char t : pendingTrim) {
+      if (writeBufLen >= kWriteBufSize && !flushBuf()) return;
+      writeBuf[writeBufLen++] = t;
+      totalBytes++;
+    }
+    pendingTrim.clear();
+  }
+  if (writeBufLen >= kWriteBufSize && !flushBuf()) return;
+  writeBuf[writeBufLen++] = c;
+  totalBytes++;
+}
+
+void ChapterTextExtractor::appendStr(const char* s) {
+  for (; *s; s++) appendChar(*s);
+}
+
 void ChapterTextExtractor::feed(const char* data, const size_t len) {
+  if (ioError_) {
+    return;
+  }
   if (pending.empty()) {
     processChunk(data, len, false);
     return;
   }
   // Prepend the carried-over partial tag/entity from the previous chunk.
-  // pending is bounded (kMaxPendingSpan) so this copy is small.
+  // pending is bounded (kMaxPendingSpan) and len is bounded (the caller's
+  // own stream chunk size), so this combined buffer is small and
+  // fixed-size (a few KB) -- but it's still a real allocation this build
+  // can't recover from if it fails (no exception handling: an earlier
+  // version of this extractor hit exactly that, via addr2line:
+  // basic_string::_M_append -> _M_mutate -> operator new -> bad_alloc ->
+  // terminate). A lightweight sanity check is enough here, though: unlike
+  // that earlier version, this extractor no longer holds the chapter's
+  // growing text in RAM at all (see the class-level comment), so there's no
+  // structural reason this small, fixed-size temporary should ever be
+  // tight on headroom -- this is a last-resort guard, not the routine case.
+  if (ESP.getMaxAllocHeap() < pending.size() + len + 2048) {
+    ioError_ = true;
+    return;
+  }
   std::string buf = std::move(pending);
   pending.clear();
   buf.append(data, len);
   processChunk(buf.data(), buf.size(), false);
 }
 
-std::string ChapterTextExtractor::finish() {
-  if (!pending.empty()) {
+size_t ChapterTextExtractor::finish() {
+  if (!ioError_ && !pending.empty()) {
     std::string leftover = std::move(pending);
     pending.clear();
     processChunk(leftover.data(), leftover.size(), true);
   }
-
-  while (!out.empty()) {
-    if (out.back() == ' ') {
-      out.pop_back();
-    } else if (out.size() >= 3 && static_cast<unsigned char>(out[out.size() - 3]) == 0xE2 &&
-               static_cast<unsigned char>(out[out.size() - 2]) == 0x80 &&
-               static_cast<unsigned char>(out[out.size() - 1]) == 0xA9) {
-      out.resize(out.size() - 3);  // trailing PARAGRAPH_SEPARATOR (U+2029, 3 UTF-8 bytes)
-    } else {
-      break;
-    }
-  }
-  return std::move(out);
+  // pendingTrim (a trailing space or paragraph separator that hasn't been
+  // committed yet -- see appendChar) is simply left unflushed here, never
+  // written: trimmable spans are deferred until real text follows them
+  // (rather than written optimistically and trimmed back afterward, which
+  // would need truncating an already-written file), so reaching finish()
+  // while one is still pending means it was genuinely trailing and is
+  // correctly dropped by doing nothing.
+  flushBuf();
+  file.close();
+  return ioError_ ? 0 : totalBytes;
 }
 
 void ChapterTextExtractor::processChunk(const char* html, const size_t htmlLen, const bool flush) {
@@ -115,8 +168,8 @@ void ChapterTextExtractor::processChunk(const char* html, const size_t htmlLen, 
           continue;
         }
 
-        if (isBlockTag(tagName) && !lastWasSpace && !out.empty()) {
-          utf8AppendCodepoint(CjkVerticalLayout::PARAGRAPH_SEPARATOR, out);
+        if (isBlockTag(tagName) && !lastWasSpace && totalBytes > 0) {
+          pendingTrim.assign(kParagraphSeparatorUtf8, 3);
           lastWasSpace = true;  // suppress a redundant separator/space right after
         }
 
@@ -150,7 +203,7 @@ void ChapterTextExtractor::processChunk(const char* html, const size_t htmlLen, 
 
       if (semi < limit && html[semi] == ';') {
         if (const char* decoded = lookupHtmlEntity(html + i, semi - i + 1)) {
-          out += decoded;
+          appendStr(decoded);
           lastWasSpace = false;
           i = semi + 1;
           continue;
@@ -165,31 +218,25 @@ void ChapterTextExtractor::processChunk(const char* html, const size_t htmlLen, 
         return;
       }
       // else: window fully scanned (or flushing) with no ';' -- literal '&'.
-      out += c;
+      appendChar(c);
       lastWasSpace = false;
       i++;
       continue;
     }
 
     if (isAsciiSpace(c)) {
-      if (!lastWasSpace && !out.empty()) {
-        out += ' ';
+      if (!lastWasSpace && totalBytes > 0) {
+        pendingTrim = " ";
         lastWasSpace = true;
       }
       i++;
       continue;
     }
 
-    out += c;
+    appendChar(c);
     lastWasSpace = false;
     i++;
   }
-}
-
-std::string extractPlainText(const char* html, const size_t htmlLen) {
-  ChapterTextExtractor extractor;
-  extractor.feed(html, htmlLen);
-  return extractor.finish();
 }
 
 }  // namespace CjkChapterText

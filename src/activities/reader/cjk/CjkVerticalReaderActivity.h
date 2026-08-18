@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 
+#include "CjkChapterFileReader.h"
 #include "CjkVerticalLayout.h"
 #include "activities/Activity.h"
 
@@ -17,11 +18,16 @@
 // Deliberately does NOT reuse lib/Epub's Section/Page/incremental-build
 // pipeline the standard reader uses -- that machinery exists to solve
 // disk-cached, resumable, background-built pagination for arbitrarily large
-// single-spine books, which a fixed-pitch CJK column layout doesn't need at
-// this scope. Chapter text is small enough (tens of KB) to paginate in RAM
-// per chapter instead. That means no bookmark/footnote/section-cache
-// support and no persisted reading position yet -- known v1 limitations,
-// not oversights.
+// single-spine books, and has its own bookmark/footnote/section-cache
+// support this engine doesn't replicate (known v1 limitations, not
+// oversights). Chapter text itself, though, is NOT kept RAM-resident:
+// on-device testing found real chapters whose extracted plain text,
+// combined with the zip/inflate stream's own ~44KB decompressor overhead,
+// exceeded available heap outright (not a fragmentation/allocation-strategy
+// problem -- confirmed via free-heap, not just largest-block, readings at
+// the failure point). Extracted text is written to and read back from a
+// small per-book SD file (CjkChapterFileReader) instead, keeping this
+// engine's own RAM usage independent of chapter size.
 class CjkVerticalReaderActivity final : public Activity {
   // shared_ptr, not unique_ptr: passed by copy to EpubReaderChapterSelectionActivity
   // (reused as-is for the TOC screen -- its UI is a plain TOC list with no
@@ -40,7 +46,16 @@ class CjkVerticalReaderActivity final : public Activity {
   bool standardFontUnloaded = false;
 
   int currentSpineIndex = 0;
-  std::string chapterText;
+  // File-backed, not RAM-resident: see the class comment above and
+  // CjkChapterText.h for why. Points at chapterTextPath, written fresh by
+  // loadChapter() on each chapter load.
+  CjkChapterFileReader chapterText;
+  // Fixed path (per book, not per chapter -- only one chapter is ever
+  // "current" at a time) for the extracted-plain-text SD file chapterText
+  // reads from. Set once in onEnter() from epub->getCachePath(), which is
+  // already guaranteed to exist by the time onEnter() runs (Epub::load()
+  // calls setupCacheDir()).
+  std::string chapterTextPath;
   std::vector<size_t> pageIndex;  // byte offsets; pageIndex[i]..pageIndex[i+1] is page i
   int currentPage = 0;
   // Set by loadChapter() on failure (href + byte size it was reading, or

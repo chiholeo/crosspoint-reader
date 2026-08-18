@@ -65,6 +65,12 @@ void CjkVerticalReaderActivity::onEnter() {
 
   ReaderUtils::applyOrientation(renderer, SETTINGS.orientation);
 
+  // Fixed per-book path for the extracted-plain-text file loadChapter()
+  // writes and chapterText reads back from -- see the class comment for
+  // why chapter text lives on SD, not in RAM. epub->getCachePath() is
+  // guaranteed to exist already: Epub::load() calls setupCacheDir().
+  chapterTextPath = epub->getCachePath() + "/cjk_chapter_text.bin";
+
   const auto path = epub->getPath();
   APP_STATE.openEpubPath = path;
   APP_STATE.saveToFile();
@@ -181,7 +187,7 @@ void CjkVerticalReaderActivity::onExit() {
   // other screens (file browser, home) use it for CJK book-title fallback
   // rendering, and it would otherwise stay unloaded until the next book open.
   if (standardFontUnloaded) sdFontSystem.ensureLoaded(renderer);
-  chapterText.clear();
+  chapterText = CjkChapterFileReader();  // closes the underlying file handle
   pageIndex.clear();
   // Clears the crash-loop guard main.cpp sets on boot-resume: reaching a
   // clean onExit() means this session didn't crash mid-read. Every other
@@ -218,54 +224,36 @@ bool CjkVerticalReaderActivity::loadChapter(const int spineIndex) {
     return false;
   }
 
-  // Release the outgoing chapter's memory before reading the next one, so
-  // its heap block is free (and available for coalescing) instead of sitting
-  // resident alongside the new chapter while it's being built. Confirmed via
-  // addr2line against a real on-device abort() that this matters: the actual
-  // crash was std::bad_alloc from CjkChapterText::ChapterTextExtractor's
-  // output string failing to grow mid-stream (basic_string::_M_mutate ->
-  // operator new -> bad_alloc -> terminate, no exception handler in this
-  // build) -- a genuine allocation failure on a fragmented heap, not the
-  // race this function's RenderLock wait above addresses.
+  // Close the outgoing chapter's read handle before the new chapter's write
+  // overwrites the same underlying file (chapterTextPath is a single fixed
+  // path -- only one chapter is ever "current"). Also drops pageIndex,
+  // matching it. This costs nothing on a failed load: render() already
+  // shows a dedicated error screen on failure (loadFailed, or independently
+  // pageIndex.size() < 2 -- see render()'s guard), never a stale view of
+  // the old chapter.
   {
     RenderLock lock(*this);
-    chapterText.clear();
-    chapterText.shrink_to_fit();
+    chapterText = CjkChapterFileReader();
     pageIndex.clear();
-    pageIndex.shrink_to_fit();
   }
 
   // Streamed, not epub->readItemContentsToBytes(): that reads the whole
-  // chapter's raw HTML into one contiguous buffer up front. On-device
-  // testing found real chapters whose raw HTML read fails even with 100+ KB
-  // of *total* free heap and a comparable largest-free-block -- the raw
-  // HTML itself was apparently larger than any single available block.
-  // Streaming through ChapterTextExtractor chunk-by-chunk means the only
-  // sizeable buffer needed is the extracted plain text (tags/attributes
-  // stripped out), which is smaller than the raw markup it came from.
+  // chapter's raw HTML into one contiguous buffer up front, which on-device
+  // testing found real chapters can exceed even with 100+ KB of free heap.
+  // ChapterTextExtractor writes its output straight to chapterTextPath
+  // through a small fixed-size buffer instead of holding any meaningful
+  // amount of the chapter's text in RAM -- see CjkChapterText.h and the
+  // class comment above for why: a large chapter's extracted text,
+  // combined with the zip/inflate stream's own fixed ~44KB decompressor
+  // overhead (state+window), was found to exceed total available heap
+  // outright on real chapters, not just fragment it. Writing to disk
+  // instead makes this independent of chapter size.
   CjkChapterText::ChapterTextExtractor extractor;
-
-  // Reserve the output string's capacity up front from the item's known raw
-  // size (plain text is always <= raw HTML) so growth never has to
-  // reallocate mid-stream -- each reallocation needs a fresh contiguous
-  // block, and repeatedly doubling into ever-larger blocks is exactly what
-  // was failing under heap fragmentation (max-alloc well below total free
-  // heap in every crash report so far). One sized reservation up front, and
-  // if even that can't be satisfied, fail cleanly before any partial state
-  // is built instead of aborting mid-extraction.
-  size_t itemSize = 0;
-  if (epub->getItemSize(spineItem.href, &itemSize) && itemSize > 0) {
-    if (itemSize > ESP.getMaxAllocHeap()) {
-      char detail[96];
-      snprintf(detail, sizeof(detail), "chapter too large for available heap: %u > max-alloc %u (%s)",
-                static_cast<unsigned>(itemSize), static_cast<unsigned>(ESP.getMaxAllocHeap()), spineItem.href.c_str());
-      lastLoadErrorDetail = detail;
-      LOG_ERR("CJKR", "%s", detail);
-      return false;
-    }
-    extractor.reserveCapacity(itemSize);
+  if (!extractor.beginWrite(chapterTextPath)) {
+    lastLoadErrorDetail = "failed to open chapter text file for writing";
+    LOG_ERR("CJKR", "%s: %s", lastLoadErrorDetail.c_str(), chapterTextPath.c_str());
+    return false;
   }
-
   ChapterTextStreamSink sink(extractor);
   constexpr size_t kStreamChunkSize = 4096;
   if (!epub->readItemContentsToStream(spineItem.href, sink, kStreamChunkSize, false)) {
@@ -275,11 +263,26 @@ bool CjkVerticalReaderActivity::loadChapter(const int spineIndex) {
     LOG_ERR("CJKR", "Failed to stream chapter %d (%s)", spineIndex, spineItem.href.c_str());
     return false;
   }
-  // Build into a local -- unlocked, matching docs/activity-manager.md's
-  // "acquire, mutate, release, then blocking work" ordering (in reverse:
-  // blocking work first here, since there's no pre-existing state to show
-  // mid-build).
-  std::string newChapterText = extractor.finish();
+  const size_t bytesWritten = extractor.finish();
+  if (extractor.ioError()) {
+    char detail[96];
+    snprintf(detail, sizeof(detail), "SD write failed extracting chapter text (%s)", spineItem.href.c_str());
+    lastLoadErrorDetail = detail;
+    LOG_ERR("CJKR", "%s", detail);
+    return false;
+  }
+
+  // Reopen for reading -- writing and reading the same file through one
+  // handle isn't something HalFile's write-buffered Print interface
+  // supports cleanly, and this also guarantees everything the extractor
+  // wrote is actually flushed and visible (finish() closed the write
+  // handle above) before pagination reads it back.
+  CjkChapterFileReader newChapterText;
+  if (!newChapterText.open(chapterTextPath) || newChapterText.size() != bytesWritten) {
+    lastLoadErrorDetail = "failed to reopen chapter text file for reading";
+    LOG_ERR("CJKR", "%s: %s", lastLoadErrorDetail.c_str(), chapterTextPath.c_str());
+    return false;
+  }
 
   // NOT prewarming the whole chapter here (the original plan's "prewarm per
   // chapter, not per page" idea) -- SdCardFont's mini glyph cache is
@@ -296,15 +299,10 @@ bool CjkVerticalReaderActivity::loadChapter(const int spineIndex) {
   // on chapterText/pageIndex/currentPage/currentSpineIndex beyond this lock
   // -- an unprotected reassignment here is exactly the "modifying shared
   // state without RenderLock" pitfall docs/activity-manager.md calls out:
-  // the render task can read a std::string or std::vector mid-reassignment,
-  // which is undefined behavior. That was the actual cause of a real
-  // on-device abort()/reboot selecting a chapter from the TOC screen --
-  // confirmed by resolving the panic PC against the local build with
-  // addr2line: it lands in libstdc++'s exception-termination path
-  // (__cxa_init_primary_exception / __cxxabiv1::__terminate), consistent
-  // with a torn string/vector read triggering something like
-  // std::out_of_range with no reachable handler, not a heap-capacity issue
-  // (the crash reproduced with heap free/fragmentation both healthy).
+  // the render task can read a std::vector mid-reassignment, which is
+  // undefined behavior. That was the actual cause of a real on-device
+  // abort()/reboot selecting a chapter from the TOC screen -- confirmed by
+  // resolving the panic PC against the local build with addr2line.
   {
     RenderLock lock(*this);
     chapterText = std::move(newChapterText);
@@ -540,7 +538,7 @@ void CjkVerticalReaderActivity::renderPage() const {
   // data it already has, so this is a fast no-op SD-wise for pages already
   // seen this session.
   if (fontId != 0 && pageEnd > pageStart) {
-    const std::string pageText = chapterText.substr(pageStart, pageEnd - pageStart);
+    const std::string pageText = CjkVerticalLayout::extractRange(chapterText, pageStart, pageEnd);
     renderer.ensureSdCardFontReady(fontId, pageText.c_str());
   }
 
@@ -554,9 +552,14 @@ void CjkVerticalReaderActivity::renderPage() const {
 
     const int columnX = viewportRightX - glyphAdvancePx - columnIndex * columnWidthPx;
 
-    const auto* base = reinterpret_cast<const unsigned char*>(chapterText.data());
-    const unsigned char* cursor = base + columnStart;
-    const unsigned char* end = base + columnEnd;
+    // One column's worth of text (bounded by rowsPerColumn, always small) --
+    // chapterText is file-backed, not an in-RAM buffer, so read this
+    // column's range out once for the walk below rather than assuming a
+    // data() pointer. See CjkChapterText.h for why chapterText is on disk.
+    const std::string columnText = CjkVerticalLayout::extractRange(chapterText, columnStart, columnEnd);
+    const auto* base = reinterpret_cast<const unsigned char*>(columnText.data());
+    const unsigned char* cursor = base;
+    const unsigned char* end = base + columnText.size();
     int row = 0;
     std::string glyphUtf8;
     while (cursor < end) {

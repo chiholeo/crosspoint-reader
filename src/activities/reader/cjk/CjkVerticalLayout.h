@@ -4,10 +4,13 @@
 #include <string>
 #include <vector>
 
+#include "CjkChapterFileReader.h"
+
 // Vertical-column pagination for the CJK reader. Pure pagination math over
 // an already-extracted plain-text chapter (see CjkChapterText) -- no SD,
-// framebuffer, or font-object access of its own. Font metrics come in as
-// plain ints the caller already measured, so this stays substrate-agnostic.
+// framebuffer, or font-object access of its own beyond reading through
+// CjkChapterFileReader. Font metrics come in as plain ints the caller
+// already measured, so this stays substrate-agnostic.
 namespace CjkVerticalLayout {
 
 struct PageMetrics {
@@ -34,16 +37,27 @@ constexpr uint32_t PARAGRAPH_SEPARATOR = 0x2029;
 
 // Byte offsets into `text` (UTF-8) where each page begins, plus a final
 // trailing entry equal to text.size(). pages[i]..pages[i+1] is page i's
-// byte range. Built once per chapter and kept in RAM -- a chapter's plain
-// text is small enough (tens of KB at most) that this is far cheaper than
-// the standard reader's disk-backed section cache, and this engine doesn't
-// need that cache's incremental-build/resume machinery for a v1.
-std::vector<size_t> buildPageIndex(const std::string& text, const PageMetrics& metrics, bool kinsokuEnabled);
+// byte range. Built once per chapter.
+//
+// `text` is a CjkChapterFileReader, not an in-RAM buffer: see
+// CjkChapterText.h for why (holding a whole chapter's text resident --
+// even split into small chunks -- competes with the zip/inflate stream's
+// own ~44KB decompressor state+window for memory that on-device testing
+// showed isn't reliably there). nextColumnEnd() below reads only a small
+// bounded window from disk for scanning, so pagination never needs more
+// than ~MAX_COLUMN_SCAN codepoints resident at a time.
+std::vector<size_t> buildPageIndex(const CjkChapterFileReader& text, const PageMetrics& metrics, bool kinsokuEnabled);
 
 // Byte offset in `text` where the column starting at `offset` ends (i.e.
 // the start of the next column), applying kinsoku if enabled. Shared by
 // buildPageIndex() and the renderer's per-column draw loop so pagination
 // and rendering always agree on exactly where each column breaks.
-size_t nextColumnEnd(const std::string& text, size_t offset, const PageMetrics& metrics, bool kinsokuEnabled);
+size_t nextColumnEnd(const CjkChapterFileReader& text, size_t offset, const PageMetrics& metrics, bool kinsokuEnabled);
+
+// Copies text[start, end) into a small contiguous std::string. Used by the
+// renderer to get a page's or column's worth of text (always small --
+// bounded by rowsPerColumn * columnsPerPage codepoints) for the c_str()-based
+// glyph/font APIs.
+std::string extractRange(const CjkChapterFileReader& text, size_t start, size_t end);
 
 }  // namespace CjkVerticalLayout
