@@ -1,5 +1,6 @@
 #include "CjkVerticalReaderActivity.h"
 
+#include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
 #include <I18n.h>
@@ -385,6 +386,35 @@ void CjkVerticalReaderActivity::openChapterSelection() {
   fontId = 0;
   sdFontSystem.ensureLoaded(renderer);
 
+  // Prewarm every chapter title's glyphs into the fallback SD font's mini
+  // cache in one batch, not just the currently-visible page: a TOC's total
+  // text is small (a few KB at most across a whole book, unlike chapter
+  // body text) so there's no memory reason to prewarm incrementally, and
+  // doing it once up front means scrolling through the list never touches
+  // SD again afterward. This also sidesteps the mechanism behind the
+  // earlier unresolved TOC crash: prewarmed glyphs land in the font's
+  // larger mini-cache, not the 8-slot on-demand overflow ring that burst
+  // under many unique characters rendering directly. Scan pass (draws
+  // nothing, just records text -- see GfxRenderer::isFontCacheScanning)
+  // then a real prewarm, the same two-step pattern EpubReaderActivity uses
+  // for page text.
+  if (auto* fcm = renderer.getFontCacheManager()) {
+    auto scope = fcm->createPrewarmScope();
+    const int tocCount = epub->getTocItemsCount();
+    for (int i = 0; i < tocCount; i++) {
+      renderer.drawText(UI_10_FONT_ID, 0, 0, epub->getTocItem(i).title.c_str());
+    }
+    scope.endScanAndPrewarm();
+  }
+  // Verifiable, not just assumed: this and the matching log right after
+  // sdFontSystem.unload() in the result handler below should show heap
+  // free landing back close to this pre-prewarm number, confirming the
+  // prewarmed data (which lives inside the SdCardFont objects
+  // sdFontSystem.unload() deletes -- see SdCardFont::freeAll(), called
+  // from its destructor) doesn't linger once the TOC screen closes.
+  LOG_DBG("CJKR", "after TOC prewarm: heap free=%u max-alloc=%u", static_cast<unsigned>(ESP.getFreeHeap()),
+          static_cast<unsigned>(ESP.getMaxAllocHeap()));
+
   startActivityForResult(
       std::make_unique<EpubReaderChapterSelectionActivity>(renderer, mappedInput, epub, path, spineAtOpen),
       [this](const ActivityResult& result) {
@@ -394,6 +424,13 @@ void CjkVerticalReaderActivity::openChapterSelection() {
         // sdFontSystem's slot free again for the same font-ID-collision
         // reason onEnter() unloads it in the first place.
         sdFontSystem.unload(renderer);
+        // Compare against "after TOC prewarm" above: should land back close
+        // to that pre-prewarm number, confirming sdFontSystem.unload()
+        // actually released the prewarmed TOC-title glyph data (deletes the
+        // SdCardFont objects it loaded -- see SdCardFontManager::unloadAll)
+        // rather than it lingering.
+        LOG_DBG("CJKR", "after sdFontSystem.unload(): heap free=%u max-alloc=%u",
+                static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
         const auto* family = fontRegistry.findFamily(CJK_READER_SETTINGS.fontFamilyName);
         if (family && fontManager.loadFamily(*family, renderer, CJK_READER_SETTINGS.fontPointSize)) {
           fontId = fontManager.getFontId(CJK_READER_SETTINGS.fontFamilyName);
