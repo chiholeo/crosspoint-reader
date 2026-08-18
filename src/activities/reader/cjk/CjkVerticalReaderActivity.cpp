@@ -359,12 +359,10 @@ void CjkVerticalReaderActivity::saveProgress() const {
   }
 }
 
-// Not currently reachable from input (see the Confirm-button comment in
-// loop()) -- kept intact, with heap logging added at each stage, so that if
-// TOC selection is revisited, the crash it's caused three times so far
-// (two causes fixed and confirmed; a third, __cxxabiv1::__unexpected with
-// an unclear trigger from a raw/unsymbolized stack dump, isn't) can be
-// pinned down from a serial log or crash report instead of guessed at again.
+// Heap logging kept at each stage from when this crashed three times
+// earlier this session (two causes fixed and confirmed; a third,
+// __cxxabiv1::__unexpected with an unclear trigger from a raw/unsymbolized
+// stack dump, was never pinned down) -- useful if a crash resurfaces here.
 void CjkVerticalReaderActivity::openChapterSelection() {
   const int spineAtOpen = currentSpineIndex;
   const std::string path = epub->getPath();
@@ -372,12 +370,43 @@ void CjkVerticalReaderActivity::openChapterSelection() {
   LOG_DBG("CJKR", "openChapterSelection: heap free=%u max-alloc=%u", static_cast<unsigned>(ESP.getFreeHeap()),
           static_cast<unsigned>(ESP.getMaxAllocHeap()));
 
+  // Swap this reader's own font out for the standard app-wide sdFontSystem
+  // while the TOC screen is up, so chapter titles render through the same,
+  // already-proven CJK-fallback mechanism the file browser/home screen use
+  // (SdCardFontSystem::setupUiFallbacks -- size-matched fallbacks for
+  // UI_10_FONT_ID etc., probed for real CJK coverage before registering).
+  // An earlier attempt registered this reader's own font as an ad-hoc
+  // fallback directly and hit an unresolved crash rendering many unique
+  // title glyphs; reusing the mechanism the rest of the app already relies
+  // on for the exact same job (CJK text in a Latin-UI list row) is a much
+  // better-tested path than a second, bespoke one.
+  { RenderLock waitForRenderIdle(*this); }
+  fontManager.unloadAll(renderer);
+  fontId = 0;
+  sdFontSystem.ensureLoaded(renderer);
+
   startActivityForResult(
       std::make_unique<EpubReaderChapterSelectionActivity>(renderer, mappedInput, epub, path, spineAtOpen),
       [this](const ActivityResult& result) {
+        // Restore this reader's own font before anything else below --
+        // needed for rendering to resume correctly whether the user picked
+        // a chapter or cancelled, and loadChapter() (if reached) needs
+        // sdFontSystem's slot free again for the same font-ID-collision
+        // reason onEnter() unloads it in the first place.
+        sdFontSystem.unload(renderer);
+        const auto* family = fontRegistry.findFamily(CJK_READER_SETTINGS.fontFamilyName);
+        if (family && fontManager.loadFamily(*family, renderer, CJK_READER_SETTINGS.fontPointSize)) {
+          fontId = fontManager.getFontId(CJK_READER_SETTINGS.fontFamilyName);
+        } else {
+          LOG_ERR("CJKR", "Failed to reload CJK reader font after chapter selection");
+        }
+
         LOG_DBG("CJKR", "chapter selection result handler entered: heap free=%u max-alloc=%u",
                 static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
-        if (result.isCancelled) return;
+        if (result.isCancelled) {
+          requestUpdate();
+          return;
+        }
         // get_if, not get: this firmware builds with -fno-exceptions, so a
         // std::get mismatch (result.data not actually holding ChapterResult)
         // would call std::terminate() and abort instead of throwing --
@@ -386,6 +415,7 @@ void CjkVerticalReaderActivity::openChapterSelection() {
         const auto* chapterResult = std::get_if<ChapterResult>(&result.data);
         if (!chapterResult) {
           LOG_ERR("CJKR", "Chapter selection returned an unexpected result type");
+          requestUpdate();
           return;
         }
         const int targetSpine = chapterResult->spineIndex;
@@ -424,17 +454,34 @@ void CjkVerticalReaderActivity::loop() {
     return;
   }
 
-  // Confirm -> openChapterSelection() is deliberately disconnected for now.
-  // TOC selection has crashed the device on three separate underlying
-  // causes this session; two are fixed and confirmed (a RenderLock data
-  // race, and a large-chapter allocation failure), but a third
-  // (__cxxabiv1::__unexpected, unclear exact trigger from a raw/unsymbolized
-  // stack dump) remains unresolved. Rather than keep iterating blind against
-  // reboots, the core reading path (page turns, chapter advance, resume) is
-  // left solid and this entry point stays unreachable until it's properly
-  // diagnosed -- see openChapterSelection()'s own comments for the heap
-  // logging added to make the next investigation faster, if/when this is
-  // revisited.
+  // Confirm -> openChapterSelection() was deliberately disconnected earlier
+  // this session after TOC selection crashed the device on three separate
+  // underlying causes: a RenderLock data race (fixed, confirmed), a
+  // large-chapter allocation failure (fixed -- and since chapterText moved
+  // off RAM entirely onto SD, the whole class of "chapter load exhausts
+  // heap" failure this was part of no longer applies to loadChapter(),
+  // which openChapterSelection()'s result handler also calls), and one
+  // unresolved case (__cxxabiv1::__unexpected, unclear exact trigger from a
+  // raw/unsymbolized stack dump). Reconnecting now that the memory-pressure
+  // causes are structurally gone, not just patched -- see
+  // openChapterSelection()'s own comments for the heap logging still in
+  // place if the unresolved case resurfaces.
+  //
+  // wasReleased, not wasPressed: EpubReaderChapterSelectionActivity itself
+  // selects on wasReleased(Confirm) (see selectChapter()'s trigger in its
+  // own loop()). Opening on wasPressed means the matching release hasn't
+  // happened yet when this activity switch happens -- it fires moments
+  // later, once the TOC screen is already active, and gets delivered to
+  // the TOC's own loop() as if the user had just released Confirm there,
+  // immediately selecting whatever's highlighted (the current chapter, by
+  // default) and closing it again. Opening on wasReleased instead means
+  // the button event is already fully finished by the time the switch
+  // happens, matching EpubReaderActivity's own Confirm -> openReaderMenu()
+  // pattern for exactly this reason.
+  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    openChapterSelection();
+    return;
+  }
 
   const auto touch = ReaderUtils::detectTouchPageTurn(renderer, mappedInput);
   auto [prevTriggered, nextTriggered, fromTilt] = ReaderUtils::detectPageTurn(mappedInput);
