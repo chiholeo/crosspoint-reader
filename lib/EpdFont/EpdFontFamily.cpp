@@ -25,11 +25,31 @@ void EpdFontFamily::getTextDimensions(const char* string, int* w, int* h, const 
 const EpdFontData* EpdFontFamily::getData(const Style style) const { return getFont(style)->data; }
 
 const EpdGlyph* EpdFontFamily::getGlyph(const uint32_t cp, const Style style) const {
-  return getFont(style)->getGlyph(cp);
+  const EpdFont* font = getFont(style);
+  const EpdGlyph* glyph = font->getGlyph(cp);
+  // getFont() only falls back to regular when the requested style's font
+  // is entirely absent (e.g. no bold file loaded) -- it has no way to know
+  // if a style that IS loaded simply has incomplete coverage for this one
+  // codepoint (a real, common case for SD card CJK fonts: a bold face often
+  // covers far fewer ideographs than its regular counterpart). Without this,
+  // a bold-styled CJK run silently drops exactly the characters bold is
+  // missing while regular has them, which reads as "the title vanished" --
+  // seen on a real device with a title reduced to just its embedded ASCII
+  // digits once every CJK glyph in it hit this gap under BOLD.
+  if (!glyph && font != regular) {
+    glyph = regular->getGlyph(cp);
+  }
+  return glyph;
 }
 
 bool EpdFontFamily::hasCodepoint(const uint32_t cp, const Style style) const {
-  return getFont(style)->hasCodepoint(cp);
+  const EpdFont* font = getFont(style);
+  if (font->hasCodepoint(cp)) return true;
+  // See getGlyph()'s comment: keep this in sync with it so a caller that
+  // gates drawing on hasCodepoint() (e.g. GfxRenderer::resolveTextFontId's
+  // CJK-fallback redirect) agrees with what getGlyph() will actually manage
+  // to draw for the same codepoint/style.
+  return font != regular && regular->hasCodepoint(cp);
 }
 
 int8_t EpdFontFamily::getKerning(const uint32_t leftCp, const uint32_t rightCp, const Style style) const {

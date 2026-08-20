@@ -17,6 +17,7 @@
 #include "MappedInputManager.h"
 #include "OpdsServerStore.h"
 #include "RecentBooksStore.h"
+#include "SdCardFontSystem.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -110,6 +111,16 @@ void HomeActivity::loadRecentCovers(int coverHeight) {
 
 void HomeActivity::onEnter() {
   Activity::onEnter();
+
+  // Don't rely on whichever activity ran before this one having left the SD
+  // CJK fallback (UI_10/UI_12_FONT_ID -> SETTINGS.sdFontFamilyName) correctly
+  // loaded -- ReaderActivity::onEnter() does this same call before dispatching
+  // to a reader, and the CJK reader's own onExit() tries to restore it after,
+  // but Home had no such call of its own and was purely trusting that
+  // inherited state. ensureLoaded() is cheap when already correct (an early
+  // return once family+size already match), so this is safe to call on every
+  // Home entry, not just the ones that actually need a reload.
+  sdFontSystem.ensureLoaded(renderer);
 
   hasOpdsServers = OPDS_STORE.hasServers();
 

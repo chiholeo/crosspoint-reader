@@ -161,11 +161,22 @@ void SdCardFontSystem::setupUiFallbacks(GfxRenderer& renderer) {
   }
 
   for (const auto& ui : kUiFontSizes) {
-    const int sdFontId = manager_.loadFamilyExtraSize(*family, renderer, ui.pointSize);
+    // loadFamilyExtraSize needs an exact installed size (family.findFile),
+    // but a UI fallback doesn't need an exact match the way the reader's own
+    // size does -- close enough reads fine for redirected CJK glyphs. Without
+    // this, a family that simply doesn't ship one of the three hardcoded UI
+    // sizes (e.g. 10pt but no exact 12pt) silently skips that one fallback
+    // while the others register fine: confirmed on a real device as CJK text
+    // rendering correctly at UI_10_FONT_ID (file browser rows, list items)
+    // while UI_12_FONT_ID text (e.g. card titles drawn with drawHeader) had
+    // no fallback at all and showed blank for any character the built-in
+    // Latin UI font can't draw.
+    const auto* nearest = family->findNearestSize(ui.pointSize);
+    const int sdFontId = nearest != nullptr ? manager_.loadFamilyExtraSize(*family, renderer, nearest->pointSize) : 0;
     if (sdFontId != 0) {
       renderer.setFallbackFont(ui.fontId, sdFontId);
     } else {
-      LOG_DBG("SDFS", "No %u pt SD glyphs for UI fallback in %s", ui.pointSize, familyName.c_str());
+      LOG_DBG("SDFS", "No SD glyphs near %u pt for UI fallback in %s", ui.pointSize, familyName.c_str());
     }
   }
 }

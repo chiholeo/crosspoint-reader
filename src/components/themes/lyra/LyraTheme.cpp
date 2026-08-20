@@ -516,6 +516,14 @@ void LyraTheme::drawRecentBookCover(GfxRenderer& renderer, Rect rect, const std:
                                hPaddingInSelection, cornerRadius, false, false, true, true, Color::LightGray);
     }
 
+    // BOLD: relies on EpdFontFamily::getGlyph()/hasCodepoint()'s per-glyph
+    // fallback to regular (see its own comment) for any SD fallback font
+    // whose bold face has less CJK coverage than regular -- a real risk in
+    // general (some fonts ship a much sparser bold), so this can still look
+    // patchy for a font converted that way. Not a risk for a font converted
+    // with matching --intervals for both --regular and --bold (confirmed
+    // equal glyph counts at conversion time), which is what this reader is
+    // set up to use.
     auto titleLines = renderer.wrappedText(UI_12_FONT_ID, book.title.c_str(), textWidth, 3, EpdFontFamily::BOLD);
 
     auto author = renderer.truncatedText(UI_10_FONT_ID, book.author.c_str(), textWidth);
