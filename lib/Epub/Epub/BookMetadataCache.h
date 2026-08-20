@@ -22,10 +22,15 @@ class BookMetadataCache {
     std::string href;
     uint32_t cumulativeSize;
     int16_t tocIndex;
+    // From the spine itemref's linear="no" attribute (defaults to true/linear
+    // per the EPUB spec when the attribute is absent). False marks content
+    // meant to be reached only via explicit navigation -- an EPUB3 nav
+    // document, footnotes, etc. -- not normal sequential page-turning.
+    bool linear;
 
-    SpineEntry() : cumulativeSize(0), tocIndex(-1) {}
-    SpineEntry(std::string href, const uint32_t cumulativeSize, const int16_t tocIndex)
-        : href(std::move(href)), cumulativeSize(cumulativeSize), tocIndex(tocIndex) {}
+    SpineEntry() : cumulativeSize(0), tocIndex(-1), linear(true) {}
+    SpineEntry(std::string href, const uint32_t cumulativeSize, const int16_t tocIndex, const bool linear = true)
+        : href(std::move(href)), cumulativeSize(cumulativeSize), tocIndex(tocIndex), linear(linear) {}
   };
 
   struct TocEntry {
@@ -98,7 +103,7 @@ class BookMetadataCache {
   // Building phase (stream to disk immediately)
   bool beginWrite();
   bool beginContentOpfPass();
-  void createSpineEntry(const std::string& href);
+  void createSpineEntry(const std::string& href, bool linear = true);
   bool endContentOpfPass();
   bool beginTocPass();
   void createTocEntry(const std::string& title, const std::string& href, const std::string& anchor, uint8_t level);

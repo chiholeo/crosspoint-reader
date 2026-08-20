@@ -8,10 +8,32 @@
 #include <Utf8.h>
 #include <ZipFile.h>
 
+#include <cctype>
+
 #include "Epub/parsers/ContainerParser.h"
 #include "Epub/parsers/ContentOpfParser.h"
 #include "Epub/parsers/TocNavParser.h"
 #include "Epub/parsers/TocNcxParser.h"
+
+namespace {
+// Fallback for books whose nav document isn't marked with properties="nav"
+// in the manifest (missing/incomplete EPUB3 metadata -- tocNavItem stays
+// empty in that case, since that's the only signal ContentOpfParser has).
+// "nav.xhtml"/"nav.html" is the near-universal filename convention most
+// authoring tools use regardless, even when the property itself is absent.
+// Matches the filename STEM exactly (case-insensitive), not just a "nav"
+// prefix, so a real chapter like "navarro.xhtml" or "naval-battle.html"
+// isn't misidentified.
+bool looksLikeNavFilename(const std::string& href) {
+  const size_t slash = href.find_last_of('/');
+  const std::string basename = slash == std::string::npos ? href : href.substr(slash + 1);
+  const size_t dot = basename.find_last_of('.');
+  const std::string stem = dot == std::string::npos ? basename : basename.substr(0, dot);
+  return stem.size() == 3 && std::tolower(static_cast<unsigned char>(stem[0])) == 'n' &&
+         std::tolower(static_cast<unsigned char>(stem[1])) == 'a' &&
+         std::tolower(static_cast<unsigned char>(stem[2])) == 'v';
+}
+}  // namespace
 
 bool Epub::findContentOpfFile(std::string* contentOpfFile) const {
   const auto containerPath = "META-INF/container.xml";
@@ -577,75 +599,98 @@ bool Epub::generateCoverBmp(bool cropped) const {
     return false;
   }
 
-  if (FsHelpers::hasJpgExtension(coverImageHref)) {
-    LOG_DBG("EBP", "Generating BMP from JPG cover image (%s mode)", cropped ? "cropped" : "fit");
-    const auto coverJpgTempPath = getCachePath() + "/.cover.jpg";
+  return convertItemToBmp(coverImageHref, getCoverBmpPath(cropped), cropped);
+}
 
-    HalFile coverJpg;
-    if (!Storage.openFileForWrite("EBP", coverJpgTempPath, coverJpg)) {
+std::string Epub::getImageBmpPath(const std::string& itemHref) const {
+  // hrefs contain '/' and aren't valid flat filenames -- hash instead, same
+  // reasoning as RecentBooksStore/OpdsServerStore's own cache-key hashing.
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%08lx", static_cast<unsigned long>(std::hash<std::string>{}(itemHref)));
+  return cachePath + "/img_" + buf + ".bmp";
+}
+
+bool Epub::generateImageBmp(const std::string& itemHref) const {
+  const std::string outputPath = getImageBmpPath(itemHref);
+  if (Storage.exists(outputPath.c_str())) {
+    return true;
+  }
+  // No cropping for in-book images -- unlike the cover (which fills a
+  // dedicated tile/card), a full-page image break should show the whole
+  // image scaled to fit, not lose content to a crop.
+  return convertItemToBmp(itemHref, outputPath, false);
+}
+
+bool Epub::convertItemToBmp(const std::string& itemHref, const std::string& outputBmpPath, const bool cropped) const {
+  if (FsHelpers::hasJpgExtension(itemHref)) {
+    LOG_DBG("EBP", "Generating BMP from JPG image (%s mode): %s", cropped ? "cropped" : "fit", itemHref.c_str());
+    const auto jpgTempPath = getCachePath() + "/.image.jpg";
+
+    HalFile jpg;
+    if (!Storage.openFileForWrite("EBP", jpgTempPath, jpg)) {
       return false;
     }
-    readItemContentsToStream(coverImageHref, coverJpg, 1024);
+    readItemContentsToStream(itemHref, jpg, 1024);
     // Explicitly close() file before reopening for reading
-    coverJpg.close();
+    jpg.close();
 
-    if (!Storage.openFileForRead("EBP", coverJpgTempPath, coverJpg)) {
+    if (!Storage.openFileForRead("EBP", jpgTempPath, jpg)) {
       return false;
     }
 
-    HalFile coverBmp;
-    if (!Storage.openFileForWrite("EBP", getCoverBmpPath(cropped), coverBmp)) {
+    HalFile bmp;
+    if (!Storage.openFileForWrite("EBP", outputBmpPath, bmp)) {
       return false;
     }
-    const bool success = JpegToBmpConverter::jpegFileToBmpStream(coverJpg, coverBmp, cropped);
+    const bool success = JpegToBmpConverter::jpegFileToBmpStream(jpg, bmp, cropped);
     // Explicitly close() files before calling Storage.remove()
-    coverJpg.close();
-    coverBmp.close();
-    Storage.remove(coverJpgTempPath.c_str());
+    jpg.close();
+    bmp.close();
+    Storage.remove(jpgTempPath.c_str());
 
     if (!success) {
-      LOG_ERR("EBP", "Failed to generate BMP from cover image");
-      Storage.remove(getCoverBmpPath(cropped).c_str());
+      LOG_ERR("EBP", "Failed to generate BMP from JPG image: %s", itemHref.c_str());
+      Storage.remove(outputBmpPath.c_str());
     }
-    LOG_DBG("EBP", "Generated BMP from JPG cover image, success: %s", success ? "yes" : "no");
+    LOG_DBG("EBP", "Generated BMP from JPG image, success: %s", success ? "yes" : "no");
     return success;
   }
 
-  if (FsHelpers::hasPngExtension(coverImageHref)) {
-    LOG_DBG("EBP", "Generating BMP from PNG cover image (%s mode)", cropped ? "cropped" : "fit");
-    const auto coverPngTempPath = getCachePath() + "/.cover.png";
+  if (FsHelpers::hasPngExtension(itemHref)) {
+    LOG_DBG("EBP", "Generating BMP from PNG image (%s mode): %s", cropped ? "cropped" : "fit", itemHref.c_str());
+    const auto pngTempPath = getCachePath() + "/.image.png";
 
-    HalFile coverPng;
-    if (!Storage.openFileForWrite("EBP", coverPngTempPath, coverPng)) {
+    HalFile png;
+    if (!Storage.openFileForWrite("EBP", pngTempPath, png)) {
       return false;
     }
-    readItemContentsToStream(coverImageHref, coverPng, 1024);
+    readItemContentsToStream(itemHref, png, 1024);
     // Explicitly close() file before reopening for reading
-    coverPng.close();
+    png.close();
 
-    if (!Storage.openFileForRead("EBP", coverPngTempPath, coverPng)) {
+    if (!Storage.openFileForRead("EBP", pngTempPath, png)) {
       return false;
     }
 
-    HalFile coverBmp;
-    if (!Storage.openFileForWrite("EBP", getCoverBmpPath(cropped), coverBmp)) {
+    HalFile bmp;
+    if (!Storage.openFileForWrite("EBP", outputBmpPath, bmp)) {
       return false;
     }
-    const bool success = PngToBmpConverter::pngFileToBmpStream(coverPng, coverBmp, cropped);
+    const bool success = PngToBmpConverter::pngFileToBmpStream(png, bmp, cropped);
     // Explicitly close() files before calling Storage.remove()
-    coverPng.close();
-    coverBmp.close();
-    Storage.remove(coverPngTempPath.c_str());
+    png.close();
+    bmp.close();
+    Storage.remove(pngTempPath.c_str());
 
     if (!success) {
-      LOG_ERR("EBP", "Failed to generate BMP from PNG cover image");
-      Storage.remove(getCoverBmpPath(cropped).c_str());
+      LOG_ERR("EBP", "Failed to generate BMP from PNG image: %s", itemHref.c_str());
+      Storage.remove(outputBmpPath.c_str());
     }
-    LOG_DBG("EBP", "Generated BMP from PNG cover image, success: %s", success ? "yes" : "no");
+    LOG_DBG("EBP", "Generated BMP from PNG image, success: %s", success ? "yes" : "no");
     return success;
   }
 
-  LOG_ERR("EBP", "Cover image is not a supported format, skipping");
+  LOG_ERR("EBP", "Image is not a supported format, skipping: %s", itemHref.c_str());
   return false;
 }
 
@@ -881,7 +926,31 @@ int Epub::getSpineIndexForTextReference() const {
           bookMetadataCache->coreMetadata.textReferenceHref.c_str());
 
   if (bookMetadataCache->coreMetadata.textReferenceHref.empty()) {
-    // there was no textReference in epub, so we return 0 (the first chapter)
+    // No explicit EPUB2 <guide type="start"> reference (common for EPUB3
+    // books, which use nav landmarks instead, or EPUB2 books that just
+    // don't declare one). Rather than blindly opening on spine[0] -- often
+    // the EPUB3 nav document itself, or a cover page -- skip past it if it
+    // is the/a spine item, so a fresh open doesn't render the nav
+    // document's own link list as if it were chapter body text.
+    for (size_t i = 0; i < getSpineItemsCount(); i++) {
+      const auto item = getSpineItem(i);
+      // linear="no" is the actual EPUB spec mechanism for "don't reach this
+      // via normal sequential reading" -- covers the nav document and
+      // anything else marked the same way (footnotes, teaser pages, a
+      // duplicate itemref pointing at the nav id twice, etc.), so it's
+      // checked first and takes priority. The nav-specific checks below are
+      // a backstop for books that skip declaring linear="no" at all.
+      // Checked independently, not either/or: a manifest with a duplicate
+      // nav.xhtml entry (a malformed but real-world case) can have
+      // properties="nav" on one id while the spine references the other --
+      // tocNavItem then holds a href that won't exact-match the spine's
+      // actual one, so the filename heuristic has to stay live as a
+      // backstop even when tocNavItem is set, not just when it's empty.
+      const bool isNav =
+          !item.linear || (!tocNavItem.empty() && item.href == tocNavItem) || looksLikeNavFilename(item.href);
+      if (isNav) continue;
+      return static_cast<int>(i);
+    }
     return 0;
   }
 
@@ -896,6 +965,15 @@ int Epub::getSpineIndexForTextReference() const {
   // This should not happen, as we checked for empty textReferenceHref earlier
   LOG_DBG("EBP", "Section not found for text reference");
   return 0;
+}
+
+bool Epub::isNonLinearSpineIndex(const int spineIndex) const {
+  if (spineIndex < 0 || spineIndex >= getSpineItemsCount()) return false;
+  const auto item = getSpineItem(spineIndex);
+  // See getSpineIndexForTextReference()'s own comment on why these three
+  // checks stay independent rather than either/or, and on linear="no"
+  // taking priority as the actual spec mechanism.
+  return !item.linear || (!tocNavItem.empty() && item.href == tocNavItem) || looksLikeNavFilename(item.href);
 }
 
 // Calculate progress in book (returns 0.0-1.0)

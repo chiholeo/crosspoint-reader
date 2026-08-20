@@ -11,7 +11,7 @@
 #include "FsHelpers.h"
 
 namespace {
-constexpr uint8_t BOOK_CACHE_VERSION = 10;  // v10: ignore ambiguous guide text references
+constexpr uint8_t BOOK_CACHE_VERSION = 11;  // v11: track spine itemref linear="no"
 constexpr char bookBinFile[] = "/book.bin";
 constexpr char tmpSpineBinFile[] = "/spine.bin.tmp";
 constexpr char tmpTocBinFile[] = "/toc.bin.tmp";
@@ -28,6 +28,7 @@ uint32_t writeSpineEntryTo(F& file, const BookMetadataCache::SpineEntry& entry) 
   serialization::writeString(file, entry.href);
   serialization::writePod(file, entry.cumulativeSize);
   serialization::writePod(file, entry.tocIndex);
+  serialization::writePod(file, entry.linear);
   return pos;
 }
 
@@ -48,6 +49,7 @@ BookMetadataCache::SpineEntry readSpineEntryFrom(F& file) {
   serialization::readString(file, entry.href);
   serialization::readPod(file, entry.cumulativeSize);
   serialization::readPod(file, entry.tocIndex);
+  serialization::readPod(file, entry.linear);
   return entry;
 }
 
@@ -388,13 +390,13 @@ uint32_t BookMetadataCache::writeTocEntry(HalFile& file, const TocEntry& entry) 
 
 // Note: for the LUT to be accurate, this **MUST** be called for all spine items before `addTocEntry` is ever called
 // this is because in this function we're marking positions of the items
-void BookMetadataCache::createSpineEntry(const std::string& href) {
+void BookMetadataCache::createSpineEntry(const std::string& href, const bool linear) {
   if (!buildMode || !spineFile) {
     LOG_DBG("BMC", "createSpineEntry called but not in build mode");
     return;
   }
 
-  const SpineEntry entry(href, 0, -1);
+  const SpineEntry entry(href, 0, -1, linear);
   if (passOut) {
     writeSpineEntryTo(*passOut, entry);
   } else {

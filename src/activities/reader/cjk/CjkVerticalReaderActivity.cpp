@@ -1,5 +1,6 @@
 #include "CjkVerticalReaderActivity.h"
 
+#include <Bitmap.h>
 #include <FontCacheManager.h>
 #include <GfxRenderer.h>
 #include <HalStorage.h>
@@ -8,6 +9,7 @@
 #include <Utf8.h>
 
 #include <algorithm>
+#include <cstdlib>
 
 #include "CjkChapterText.h"
 #include "CjkKinsoku.h"
@@ -75,7 +77,7 @@ void CjkVerticalReaderActivity::onEnter() {
   const auto path = epub->getPath();
   APP_STATE.openEpubPath = path;
   APP_STATE.saveToFile();
-  RECENT_BOOKS.addBook(path, epub->getTitle(), epub->getAuthor(), epub->getCoverBmpPath());
+  RECENT_BOOKS.addBook(path, epub->getTitle(), epub->getAuthor(), epub->getThumbBmpPath());
 
   if (CJK_READER_SETTINGS.fontFamilyName.empty()) {
     LOG_ERR("CJKR", "CJK reader enabled with no font family configured");
@@ -86,15 +88,7 @@ void CjkVerticalReaderActivity::onEnter() {
   }
 
   fontRegistry.discover();
-  const auto* family = fontRegistry.findFamily(CJK_READER_SETTINGS.fontFamilyName);
-  if (!family) {
-    LOG_ERR("CJKR", "CJK font family '%s' not found on SD card (registry has %d families)",
-            CJK_READER_SETTINGS.fontFamilyName.c_str(), fontRegistry.getFamilyCount());
-    loadFailed = true;
-    loadFailMessage = tr(STR_CJK_FONT_NOT_FOUND);
-    requestUpdate();
-    return;
-  }
+
   // ReaderActivity::onEnter() unconditionally loads the standard reader's
   // SD font (sdFontSystem.ensureLoaded()) before dispatching here. Font IDs
   // are content-hash based and global to the renderer, so if this is the
@@ -104,15 +98,10 @@ void CjkVerticalReaderActivity::onEnter() {
   sdFontSystem.unload(renderer);
   standardFontUnloaded = true;
 
-  if (!fontManager.loadFamily(*family, renderer, CJK_READER_SETTINGS.fontPointSize)) {
-    LOG_ERR("CJKR", "Failed to load CJK font family '%s' at %u pt", CJK_READER_SETTINGS.fontFamilyName.c_str(),
-            CJK_READER_SETTINGS.fontPointSize);
-    loadFailed = true;
-    loadFailMessage = tr(STR_CJK_FONT_LOAD_ERROR);
+  if (!loadReaderFonts()) {
     requestUpdate();
     return;
   }
-  fontId = fontManager.getFontId(CJK_READER_SETTINGS.fontFamilyName);
 
   // Deliberately NOT registering our font as the UI CJK fallback here
   // anymore (an earlier round did). It fixed CJK titles showing as blank in
@@ -139,35 +128,87 @@ void CjkVerticalReaderActivity::onEnter() {
   viewportBottomY = renderer.getScreenHeight() - marginBottom -
                     std::max<int>(screenMargin, UITheme::getInstance().getStatusBarHeight());
 
-  // Uncompressed getLineHeight() -- a compressed step (an earlier attempt
-  // used 0.82x) shortens the space BETWEEN rows without shrinking the
-  // glyph BITMAPS drawn into them, so the last row's glyph can extend past
-  // its allotted step. For the very last row in a column that means past
-  // the viewport's bottom edge entirely: an on-device crash report showed
-  // "Outside range (x, 800) -> (800, y)" draw errors (logical Y=800 is one
-  // past this screen's actual height) right before an abort(), and a
-  // denser page from tighter spacing also means more unique glyphs
-  // competing for the same 8-slot on-demand overflow cache that caused
-  // every earlier TOC crash -- both real costs for a cosmetic tightening
-  // that isn't worth it until there's a safe way to verify a compressed
-  // value against real glyph metrics instead of guessing a fixed factor.
-  const int cellSize = renderer.getLineHeight(fontId);
-  glyphAdvancePx = std::max(cellSize, 1);
+  // Compressed step: an earlier attempt at this (0.82x) caused a real
+  // on-device crash, but that was before any margin logic existed to
+  // account for it -- glyphs were drawn at full size into a shrunk grid
+  // with zero protection against the resulting overhang. This time the
+  // safety margins below are computed against trueLineHeight (the font's
+  // actual, uncompressed size -- i.e. the real glyph size being drawn),
+  // not the compressed step, so they stay just as protective regardless of
+  // how tight kLineCompression is set. 0.90 is a deliberately modest
+  // starting point (short of the 0.82 that caused problems) -- visual
+  // tightness is a judgment call to dial in from here, crash-safety is not.
+  const int trueLineHeight = std::max(renderer.getLineHeight(fontId), 1);
+  constexpr float kLineCompression = 0.90f;
+  glyphAdvancePx = std::max(static_cast<int>(trueLineHeight * kLineCompression + 0.5f), 1);
   columnWidthPx = glyphAdvancePx + columnSpacingPx(CJK_READER_SETTINGS.columnSpacing);
 
-  metrics.rowsPerColumn = std::max(1, (viewportBottomY - viewportTopY) / glyphAdvancePx);
+  // Reserve room for headingFontId's taller glyphs at the bottom of the
+  // viewport: a heading character can land on a column's last row (the
+  // fixed grid step doesn't grow for it -- see headingFontId's own
+  // "same grid step, some overflow" comment), and without this margin that
+  // overflow lands past viewportBottomY, overlapping the page-number status
+  // bar below it. Reserving the size difference up front instead means the
+  // grid itself has one fewer row of slack rather than the heading glyph
+  // overflowing into UI chrome. 0 if headingFontId isn't loaded, or isn't
+  // actually taller than the (uncompressed) reading font size.
+  const int headingExtraHeight =
+      headingFontId != 0 ? std::max(0, renderer.getLineHeight(headingFontId) - trueLineHeight) : 0;
+
+  // Ordinary (non-heading) rows also have no guarantee against bleeding
+  // into the status bar: a glyph's actual rendered bitmap can exceed its
+  // nominal cell (confirmed on-device: an "Outside range"
+  // draw-past-the-screen-edge abort() was reproduced this way). Each row's
+  // Y position comes straight from row*glyphAdvancePx (not accumulated
+  // from previous rows' actual drawn extent), so compression doesn't
+  // compound down the column -- every row overhangs its own cell by the
+  // same fixed (trueLineHeight - glyphAdvancePx), independent of row
+  // index. What matters for crash-safety is only the last row's absolute
+  // bottom edge, so reserving that one overhang amount once (not per row)
+  // is what the math below actually needs -- verified algebraically, not
+  // guessed: with this margin, (rowsPerColumn-1)*glyphAdvancePx +
+  // trueLineHeight <= viewportBottomY - viewportTopY always holds. A full
+  // row of uncompressed slack (confirmed on-device to fully stop the
+  // overflow at 1.0x) left more empty space above the footer than wanted;
+  // settled on 2/3 of a trueLineHeight row as the residual per-glyph-
+  // overshoot margin (same reasoning as before compression existed), plus
+  // this compression overhang on top.
+  const int compressionOverhangPerRow = std::max(0, trueLineHeight - glyphAdvancePx);
+  const int rowSafetyMarginPx = trueLineHeight * 2 / 3 + compressionOverhangPerRow;
+  metrics.rowsPerColumn =
+      std::max(1, (viewportBottomY - headingExtraHeight - rowSafetyMarginPx - viewportTopY) / glyphAdvancePx);
   metrics.columnsPerPage = std::max(1, (viewportRightX - viewportLeftX) / columnWidthPx);
 
   Progress resume;
   const bool hasResume = loadProgress(resume);
+
+  // Shown once, only on a genuinely fresh open (never on resume -- picking
+  // back up mid-book shouldn't interrupt every session with the cover
+  // again). generateCoverBmp() is a no-op if already cached; a failure
+  // here (e.g. no cover art in this EPUB) just skips straight to the first
+  // chapter, same graceful fallback SleepActivity's cover rendering
+  // already uses.
+  if (!hasResume && epub->generateCoverBmp()) {
+    coverBmpPath = epub->getCoverBmpPath();
+    showingCover = true;
+  }
+
   // No saved position: start at the EPUB's declared text-reference spine
   // item, not spine[0]. Spine[0] is very often a cover or nav/TOC document,
   // not the first real chapter -- without this a fresh open renders the
   // nav document's own link list as if it were chapter body text. Mirrors
   // EpubReaderActivity's exact same fallback for the same reason.
-  const int startSpine = hasResume ? resume.spineIndex : epub->getSpineIndexForTextReference();
+  //
+  // A saved position can also point at a non-linear item (the nav
+  // document, or anything else spine-marked linear="no"), if it was saved
+  // before isNonLinearSpineIndex() existed to steer opens away from it --
+  // self-correct rather than resuming into it, since its byte offset was
+  // into that item's own text, not real chapter content worth seeking
+  // back into.
+  const bool resumeIsNav = hasResume && epub->isNonLinearSpineIndex(resume.spineIndex);
+  const int startSpine = (hasResume && !resumeIsNav) ? resume.spineIndex : epub->getSpineIndexForTextReference();
   if (loadChapter(startSpine)) {
-    if (hasResume) seekToByteOffset(resume.byteOffset);
+    if (hasResume && !resumeIsNav) seekToByteOffset(resume.byteOffset);
   } else if (startSpine != 0 && loadChapter(0)) {
     // Saved chapter no longer resolves (different/edited book sharing this
     // cache dir) -- start over from the beginning rather than fail outright.
@@ -179,17 +220,81 @@ void CjkVerticalReaderActivity::onEnter() {
   requestUpdate();
 }
 
+bool CjkVerticalReaderActivity::loadReaderFonts() {
+  const auto* family = fontRegistry.findFamily(CJK_READER_SETTINGS.fontFamilyName);
+  if (!family) {
+    LOG_ERR("CJKR", "CJK font family '%s' not found on SD card (registry has %d families)",
+            CJK_READER_SETTINGS.fontFamilyName.c_str(), fontRegistry.getFamilyCount());
+    loadFailed = true;
+    loadFailMessage = tr(STR_CJK_FONT_NOT_FOUND);
+    return false;
+  }
+
+  if (!fontManager.loadFamily(*family, renderer, CJK_READER_SETTINGS.fontPointSize)) {
+    LOG_ERR("CJKR", "Failed to load CJK font family '%s' at %u pt", CJK_READER_SETTINGS.fontFamilyName.c_str(),
+            CJK_READER_SETTINGS.fontPointSize);
+    loadFailed = true;
+    loadFailMessage = tr(STR_CJK_FONT_LOAD_ERROR);
+    return false;
+  }
+  fontId = fontManager.getFontId(CJK_READER_SETTINGS.fontFamilyName);
+
+  // Additively load one size tier up from the reading size, for <h1>-<h6>
+  // headings (see the header's headingFontId comment). loadFamilyExtraSize
+  // needs an exact installed size, so find the smallest one actually larger
+  // than the reading size rather than guessing a percentage bump that might
+  // not exist on disk; 0 (fontManager's own "not found" sentinel) if the
+  // family only ships the one size already loaded -- headings then just
+  // don't visually stand out, not a load failure.
+  uint8_t headingPointSize = CJK_READER_SETTINGS.fontPointSize;
+  for (const uint8_t sz : family->availableSizes()) {
+    if (sz > CJK_READER_SETTINGS.fontPointSize &&
+        (headingPointSize == CJK_READER_SETTINGS.fontPointSize || sz < headingPointSize)) {
+      headingPointSize = sz;
+    }
+  }
+  headingFontId = headingPointSize > CJK_READER_SETTINGS.fontPointSize
+                     ? fontManager.loadFamilyExtraSize(*family, renderer, headingPointSize)
+                     : 0;
+
+  // Additively load the size closest to SMALL_FONT_ID's own (8pt -- see
+  // SdCardFontSystem's kUiFontSizes) so the status bar's book-title text
+  // (drawn with SMALL_FONT_ID, see BaseTheme::drawStatusBar) can redirect to
+  // real CJK glyphs instead of boxes. loadFamilyExtraSize needs an exact
+  // installed size, same constraint headingPointSize's search works around.
+  uint8_t titlePointSize = 0;
+  for (const uint8_t sz : family->availableSizes()) {
+    if (titlePointSize == 0 || std::abs(static_cast<int>(sz) - 8) < std::abs(static_cast<int>(titlePointSize) - 8)) {
+      titlePointSize = sz;
+    }
+  }
+  titleFallbackFontId = titlePointSize != 0 ? fontManager.loadFamilyExtraSize(*family, renderer, titlePointSize) : 0;
+  if (titleFallbackFontId != 0) {
+    renderer.setFallbackFont(SMALL_FONT_ID, titleFallbackFontId);
+    // One short, unchanging string -- prewarm once so the per-page status
+    // bar draw never triggers an on-demand SD glyph load.
+    if (epub) renderer.ensureSdCardFontReady(titleFallbackFontId, epub->getTitle().c_str());
+  }
+
+  return true;
+}
+
 void CjkVerticalReaderActivity::onExit() {
   Activity::onExit();
   renderer.setOrientation(GfxRenderer::Orientation::Portrait);
   fontManager.unloadAll(renderer);
   fontId = 0;
+  headingFontId = 0;
+  titleFallbackFontId = 0;
   // Restore the standard reader's SD font if we unloaded it (see onEnter):
   // other screens (file browser, home) use it for CJK book-title fallback
   // rendering, and it would otherwise stay unloaded until the next book open.
   if (standardFontUnloaded) sdFontSystem.ensureLoaded(renderer);
   chapterText = CjkChapterFileReader();  // closes the underlying file handle
   pageIndex.clear();
+  pageStartStyle.clear();
+  pageImageIndex.clear();
+  chapterImages.clear();
   // Clears the crash-loop guard main.cpp sets on boot-resume: reaching a
   // clean onExit() means this session didn't crash mid-read. Every other
   // reader activity clears this the same way.
@@ -249,8 +354,9 @@ bool CjkVerticalReaderActivity::loadChapter(const int spineIndex) {
   // overhead (state+window), was found to exceed total available heap
   // outright on real chapters, not just fragment it. Writing to disk
   // instead makes this independent of chapter size.
+  const std::string chapterBaseDir = spineItem.href.substr(0, spineItem.href.find_last_of('/') + 1);
   CjkChapterText::ChapterTextExtractor extractor;
-  if (!extractor.beginWrite(chapterTextPath)) {
+  if (!extractor.beginWrite(chapterTextPath, chapterBaseDir)) {
     lastLoadErrorDetail = "failed to open chapter text file for writing";
     LOG_ERR("CJKR", "%s: %s", lastLoadErrorDetail.c_str(), chapterTextPath.c_str());
     return false;
@@ -292,8 +398,17 @@ bool CjkVerticalReaderActivity::loadChapter(const int spineIndex) {
   // set makes that resident cache grow to fit the LARGEST chapter seen this
   // session and never shrinks back down on its own. renderPage() prewarms
   // one page's text at a time instead -- a bounded, small working set.
-  std::vector<size_t> newPageIndex =
-      CjkVerticalLayout::buildPageIndex(newChapterText, metrics, CJK_READER_SETTINGS.kinsokuEnabled);
+  std::vector<int> newPageImageIndex;
+  std::vector<size_t> newPageIndex = CjkVerticalLayout::buildPageIndex(
+      newChapterText, metrics, CJK_READER_SETTINGS.kinsokuEnabled, &newPageImageIndex);
+  // Heading (vs normal) text level active at the start of each page -- see
+  // the header's pageStartStyle comment for why this is a separate pass
+  // rather than threaded through buildPageIndex's own scan.
+  std::vector<uint8_t> newPageStartStyle = CjkVerticalLayout::computePageStartStyles(newChapterText, newPageIndex);
+  // Resolved <img> hrefs found during extraction, in extraction order --
+  // pageImageIndex's per-page values index into this. See
+  // CjkChapterText::ChapterTextExtractor::getImagePaths()'s own comment.
+  std::vector<std::string> newChapterImages = extractor.getImagePaths();
 
   // Commit under a RenderLock. ActivityManager runs render() on a separate
   // task from loop()/result handlers, and this reader has no synchronization
@@ -308,6 +423,9 @@ bool CjkVerticalReaderActivity::loadChapter(const int spineIndex) {
     RenderLock lock(*this);
     chapterText = std::move(newChapterText);
     pageIndex = std::move(newPageIndex);
+    pageStartStyle = std::move(newPageStartStyle);
+    pageImageIndex = std::move(newPageImageIndex);
+    chapterImages = std::move(newChapterImages);
     currentSpineIndex = spineIndex;
     currentPage = 0;
   }
@@ -384,6 +502,7 @@ void CjkVerticalReaderActivity::openChapterSelection() {
   { RenderLock waitForRenderIdle(*this); }
   fontManager.unloadAll(renderer);
   fontId = 0;
+  headingFontId = 0;
   sdFontSystem.ensureLoaded(renderer);
 
   // Prewarm every chapter title's glyphs into the fallback SD font's mini
@@ -431,11 +550,12 @@ void CjkVerticalReaderActivity::openChapterSelection() {
         // rather than it lingering.
         LOG_DBG("CJKR", "after sdFontSystem.unload(): heap free=%u max-alloc=%u",
                 static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
-        const auto* family = fontRegistry.findFamily(CJK_READER_SETTINGS.fontFamilyName);
-        if (family && fontManager.loadFamily(*family, renderer, CJK_READER_SETTINGS.fontPointSize)) {
-          fontId = fontManager.getFontId(CJK_READER_SETTINGS.fontFamilyName);
-        } else {
-          LOG_ERR("CJKR", "Failed to reload CJK reader font after chapter selection");
+        // loadReaderFonts(), not a hand-rolled reload: this is exactly the
+        // call site where headingFontId was previously forgotten (only
+        // fontId was restored here), leaving it dangling after unloadAll()
+        // above -- see loadReaderFonts()'s own comment.
+        if (!loadReaderFonts()) {
+          LOG_ERR("CJKR", "Failed to reload CJK reader fonts after chapter selection");
         }
 
         LOG_DBG("CJKR", "chapter selection result handler entered: heap free=%u max-alloc=%u",
@@ -488,6 +608,20 @@ void CjkVerticalReaderActivity::loop() {
   if (ReaderUtils::handleBackNavigation(
           mappedInput, activityManager, epub ? epub->getPath().c_str() : "",
           {this, [](void* ctx) { static_cast<CjkVerticalReaderActivity*>(ctx)->onGoHome(); }})) {
+    return;
+  }
+
+  if (showingCover) {
+    // Dismiss on any page-turn or Confirm input -- Back already exited to
+    // home above. Doesn't advance a page or open the TOC: the cover isn't
+    // "page 0", it's a one-time intro the first real input clears.
+    const auto touch = ReaderUtils::detectTouchPageTurn(renderer, mappedInput);
+    auto [prevTriggered, nextTriggered, fromTilt] = ReaderUtils::detectPageTurn(mappedInput);
+    if (prevTriggered || touch.prev || nextTriggered || touch.next ||
+        mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+      showingCover = false;
+      requestUpdate();
+    }
     return;
   }
 
@@ -555,7 +689,13 @@ void CjkVerticalReaderActivity::loop() {
       currentPage--;
       requestUpdate();
     } else if (currentSpineIndex > 0) {
-      const int target = currentSpineIndex - 1;
+      // Skip past any non-linear spine items (nav document, etc.) instead
+      // of landing on one -- same reasoning as onEnter()'s opening-chapter
+      // and stale-resume handling: they're real spine items in some books,
+      // but their content is a link list or similar, not a chapter.
+      int target = currentSpineIndex - 1;
+      while (target >= 0 && epub->isNonLinearSpineIndex(target)) target--;
+      if (target < 0) return;
       LOG_DBG("CJKR", "page-turn prev: before loadChapter(%d), heap free=%u max-alloc=%u", target,
               static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
       if (loadChapter(target)) {
@@ -571,7 +711,13 @@ void CjkVerticalReaderActivity::loop() {
       currentPage++;
       requestUpdate();
     } else if (currentSpineIndex + 1 < epub->getSpineItemsCount()) {
-      const int target = currentSpineIndex + 1;
+      int target = currentSpineIndex + 1;
+      const int spineCount = epub->getSpineItemsCount();
+      while (target < spineCount && epub->isNonLinearSpineIndex(target)) target++;
+      if (target >= spineCount) {
+        onGoHome();
+        return;
+      }
       LOG_DBG("CJKR", "page-turn next: before loadChapter(%d), heap free=%u max-alloc=%u", target,
               static_cast<unsigned>(ESP.getFreeHeap()), static_cast<unsigned>(ESP.getMaxAllocHeap()));
       if (loadChapter(target)) {
@@ -587,6 +733,31 @@ void CjkVerticalReaderActivity::loop() {
 
 void CjkVerticalReaderActivity::render(RenderLock&&) {
   renderer.clearScreen();
+
+  if (showingCover) {
+    renderCoverPage();  // handles its own display call(s) -- see its comment
+    return;
+  }
+
+  // Full-page image break (see CjkVerticalLayout::buildPageIndex()'s
+  // outPageImageIndex): same early-return, no-status-bar treatment as the
+  // cover screen above, so an in-book illustration shows edge-to-edge
+  // rather than sharing the page with reading-progress chrome.
+  // generateImageBmp() is a no-op once the BMP already exists in cache
+  // (same short-circuit as generateCoverBmp()), so revisiting this page is
+  // cheap after the first conversion. A failure here (corrupt/unsupported
+  // image) falls through to the normal text page instead -- pageImageIndex
+  // still points at the image, but the loop() page-turn just moves the
+  // reader forward next time same as any other page, rather than getting
+  // stuck showing nothing.
+  if (static_cast<size_t>(currentPage) < pageImageIndex.size() && pageImageIndex[currentPage] >= 0) {
+    const std::string& imageHref = chapterImages[pageImageIndex[currentPage]];
+    if (epub->generateImageBmp(imageHref)) {
+      renderFullPageBitmap(epub->getImageBmpPath(imageHref));
+      saveProgress();
+      return;
+    }
+  }
 
   if (loadFailed || !initialized || pageIndex.size() < 2) {
     // Wrapped, multi-line -- a single drawCenteredText call doesn't wrap,
@@ -613,6 +784,68 @@ void CjkVerticalReaderActivity::render(RenderLock&&) {
   saveProgress();
 }
 
+void CjkVerticalReaderActivity::renderCoverPage() const { renderFullPageBitmap(coverBmpPath); }
+
+void CjkVerticalReaderActivity::renderFullPageBitmap(const std::string& bmpPath) const {
+  // Simple centered, scaled-to-fit rendering -- no crop-mode/filter options
+  // like SleepActivity's cover screen, since this is a one-time intro
+  // screen (or an in-book image break) inside the reader, not a persistent
+  // idle display users tune.
+  HalFile file;
+  if (!Storage.openFileForRead("CJKR", bmpPath, file)) return;
+  Bitmap bitmap(file);
+  if (bitmap.parseHeaders() != BmpReaderError::Ok) return;
+
+  const int pageWidth = renderer.getScreenWidth();
+  const int pageHeight = renderer.getScreenHeight();
+  int x, y;
+  if (bitmap.getWidth() > pageWidth || bitmap.getHeight() > pageHeight) {
+    const float ratio = static_cast<float>(bitmap.getWidth()) / static_cast<float>(bitmap.getHeight());
+    const float screenRatio = static_cast<float>(pageWidth) / static_cast<float>(pageHeight);
+    if (ratio > screenRatio) {
+      x = 0;
+      y = std::round((static_cast<float>(pageHeight) - static_cast<float>(pageWidth) / ratio) / 2);
+    } else {
+      x = std::round((static_cast<float>(pageWidth) - static_cast<float>(pageHeight) * ratio) / 2);
+      y = 0;
+    }
+  } else {
+    x = (pageWidth - bitmap.getWidth()) / 2;
+    y = (pageHeight - bitmap.getHeight()) / 2;
+  }
+
+  renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight);
+
+  // GfxRenderer::drawBitmap only reproduces real gray levels in
+  // GRAYSCALE_MSB/LSB render mode -- in the plain BW mode this reader
+  // otherwise always stays in (pure text, no prior need for grayscale),
+  // its val<3 check draws every non-white dithered pixel as solid black,
+  // which is what made the 2-bit-dithered cover BMP look flat and blocky
+  // instead of showing real gray. This is the same three-pass base/LSB/MSB
+  // sequence SleepActivity's own cover rendering already uses for exactly
+  // this reason.
+  if (bitmap.hasGreyscale()) {
+    renderer.displayGrayscaleBase(HalDisplay::HALF_REFRESH);
+
+    bitmap.rewindToData();
+    renderer.clearScreen(0x00);
+    renderer.setRenderMode(GfxRenderer::GRAYSCALE_LSB);
+    renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight);
+    renderer.copyGrayscaleLsbBuffers();
+
+    bitmap.rewindToData();
+    renderer.clearScreen(0x00);
+    renderer.setRenderMode(GfxRenderer::GRAYSCALE_MSB);
+    renderer.drawBitmap(bitmap, x, y, pageWidth, pageHeight);
+    renderer.copyGrayscaleMsbBuffers();
+
+    renderer.displayGrayBuffer();
+    renderer.setRenderMode(GfxRenderer::BW);
+  } else {
+    renderer.displayBuffer();
+  }
+}
+
 void CjkVerticalReaderActivity::renderPage() const {
   const size_t pageStart = pageIndex[currentPage];
   const size_t pageEnd = pageIndex[currentPage + 1];
@@ -620,11 +853,37 @@ void CjkVerticalReaderActivity::renderPage() const {
   // Prewarm just this page's glyphs (see loadChapter()'s comment on why not
   // the whole chapter). Cheap even on a revisit: SdCardFont keeps resident
   // data it already has, so this is a fast no-op SD-wise for pages already
-  // seen this session.
+  // seen this session. Prewarms headingFontId too (harmless no-op if this
+  // page has no heading text) -- it's a distinct SdCardFont instance with
+  // its own advance-table cache.
   if (fontId != 0 && pageEnd > pageStart) {
-    const std::string pageText = CjkVerticalLayout::extractRange(chapterText, pageStart, pageEnd);
+    std::string pageText = CjkVerticalLayout::extractRange(chapterText, pageStart, pageEnd);
+    // Also prewarm each rotated-punctuation codepoint's Vertical Forms
+    // substitute (see CjkKinsoku::verticalFormFor): the draw loop may
+    // switch to it instead of rotating, and it won't otherwise appear
+    // anywhere in pageText for this pass to find on its own. A no-op
+    // appendix if the loaded font doesn't have that range at all.
+    const unsigned char* scan = reinterpret_cast<const unsigned char*>(pageText.data());
+    const unsigned char* scanEnd = scan + pageText.size();
+    std::string extra;
+    while (scan < scanEnd) {
+      const unsigned char* before = scan;
+      const uint32_t cp = utf8NextCodepoint(&scan);
+      if (scan == before) break;
+      const uint32_t vcp = CjkKinsoku::verticalFormFor(cp);
+      if (vcp != 0) utf8AppendCodepoint(vcp, extra);
+    }
+    pageText += extra;
     renderer.ensureSdCardFontReady(fontId, pageText.c_str());
+    if (headingFontId != 0) renderer.ensureSdCardFontReady(headingFontId, pageText.c_str());
   }
+
+  // 2-bit style state (bit0=heading, bit1=bold -- see
+  // CjkVerticalLayout::STYLE_BIT_HEADING/STYLE_BIT_BOLD) active right now,
+  // threaded through the column loop below starting from this page's known
+  // opening state (a heading and/or bold run spanning a page boundary
+  // carries over correctly without rescanning from the chapter start).
+  uint8_t currentStyle = static_cast<size_t>(currentPage) < pageStartStyle.size() ? pageStartStyle[currentPage] : 0;
 
   int columnIndex = 0;
   size_t columnStart = pageStart;
@@ -656,21 +915,58 @@ void CjkVerticalReaderActivity::renderPage() const {
       // but bail out rather than hang if it ever is.
       if (cursor == before) break;
 
+      // Zero-width text-level marker (see CjkVerticalLayout.h) -- update
+      // state and move on without drawing or advancing to the next row.
+      if (CjkVerticalLayout::isStyleSentinel(cp)) {
+        currentStyle = CjkVerticalLayout::styleFromSentinel(cp);
+        continue;
+      }
+
+      const bool isHeadingActive = (currentStyle & CjkVerticalLayout::STYLE_BIT_HEADING) != 0;
+      const bool isBoldActive = (currentStyle & CjkVerticalLayout::STYLE_BIT_BOLD) != 0;
+      const EpdFontFamily::Style drawStyle = isBoldActive ? EpdFontFamily::BOLD : EpdFontFamily::REGULAR;
+
+      // headingFontId may be 0 (family has no larger size installed -- see
+      // onEnter()'s comment), in which case headings just render at the
+      // normal size rather than failing.
+      const int drawFontId = (isHeadingActive && headingFontId != 0) ? headingFontId : fontId;
+
       glyphUtf8.clear();
       utf8AppendCodepoint(cp, glyphUtf8);
       const int y = viewportTopY + row * glyphAdvancePx;
 
-      if (CjkKinsoku::isRotatedPunctuation(cp)) {
+      // Prefer a real Unicode Vertical Forms glyph over rotating the
+      // horizontal one, when the loaded font actually has it (only true if
+      // it was converted with that codepoint range included -- see
+      // CjkKinsoku::verticalFormFor's own comment). Drawn exactly like any
+      // other upright character: no rotation, no offset, since these glyphs
+      // are purpose-built to sit correctly in their own advance box for
+      // vertical use. Confirmed against the font's real bitmap data (not
+      // just assumed) to look correct for every mapped pair -- see the
+      // rotation-vs-real-glyph specimen this was validated against.
+      const uint32_t verticalCp = CjkKinsoku::verticalFormFor(cp);
+      const auto fontIt = verticalCp != 0 ? renderer.getFontMap().find(drawFontId) : renderer.getFontMap().end();
+      const bool hasVerticalForm = verticalCp != 0 && fontIt != renderer.getFontMap().end() &&
+                                   fontIt->second.hasCodepoint(verticalCp, drawStyle);
+
+      if (hasVerticalForm) {
+        std::string verticalUtf8;
+        utf8AppendCodepoint(verticalCp, verticalUtf8);
+        renderer.drawText(drawFontId, columnX, y, verticalUtf8.c_str(), true, drawStyle);
+      } else if (CjkKinsoku::isRotatedPunctuation(cp)) {
         // Cell is [columnX, columnX+glyphAdvancePx) x [y, y+glyphAdvancePx)
-        // -- the same fixed step every other glyph in this column uses;
-        // drawGlyphRotated90CCW centers the rotated ink within it.
-        renderer.drawGlyphRotated90CCW(fontId, cp, columnX, y, glyphAdvancePx);
+        // -- the same fixed step every other glyph in this column uses. A
+        // heading-sized rotated glyph is drawn at this same fixed cell too
+        // (the deliberate "same grid step, some overflow" trade-off -- see
+        // headingFontId's own comment).
+        renderer.drawGlyphRotated90CCW(drawFontId, cp, columnX, y, glyphAdvancePx, true, drawStyle,
+                                       CjkKinsoku::isCenteredRotation(cp));
       } else {
         int8_t dx = 0;
         int8_t dy = 0;
         CjkKinsoku::getVerticalPunctuationOffset(cp, static_cast<uint16_t>(glyphAdvancePx),
                                                  static_cast<uint16_t>(glyphAdvancePx), dx, dy);
-        renderer.drawText(fontId, columnX + dx, y + dy, glyphUtf8.c_str());
+        renderer.drawText(drawFontId, columnX + dx, y + dy, glyphUtf8.c_str(), true, drawStyle);
       }
 
       row++;
@@ -682,8 +978,19 @@ void CjkVerticalReaderActivity::renderPage() const {
 }
 
 void CjkVerticalReaderActivity::renderStatusBar() const {
+  // GUI.drawStatusBar, not a hand-rolled page-number label: the same
+  // shared (non-virtual, theme-independent) BaseTheme method
+  // EpubReaderActivity uses, so this reader's status bar matches the
+  // standard reader's layout/content (progress %, progress bar, battery --
+  // whatever SETTINGS.statusBarSpec() has enabled) instead of a bespoke,
+  // sparser one. Its own Y position already comes from
+  // UITheme::getStatusBarHeight(), the same metric viewportBottomY already
+  // reserves room for in onEnter() -- see viewportBottomY's own margin
+  // calc -- so the two agree without needing a separate size to track.
   const int totalPages = std::max<int>(1, static_cast<int>(pageIndex.size()) - 1);
-  const std::string pageLabel = std::to_string(currentPage + 1) + " / " + std::to_string(totalPages);
-  const int y = viewportBottomY + (renderer.getScreenHeight() - viewportBottomY - renderer.getLineHeight(UI_10_FONT_ID)) / 2;
-  renderer.drawCenteredText(UI_10_FONT_ID, y, pageLabel.c_str());
+  const int currentPageNum = currentPage + 1;
+  const float chapterProgress =
+      totalPages > 0 ? static_cast<float>(currentPageNum) / static_cast<float>(totalPages) : 0.0f;
+  const float bookProgress = epub ? epub->calculateProgress(currentSpineIndex, chapterProgress) * 100.0f : 0.0f;
+  GUI.drawStatusBar(renderer, bookProgress, currentPageNum, totalPages, epub ? epub->getTitle() : "");
 }

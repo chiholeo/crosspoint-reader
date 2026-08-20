@@ -36,6 +36,10 @@ class Epub {
   bool parseTocNavFile() const;
   void discoverCssFilesFromZip();
   void parseCssFiles() const;
+  // Shared JPG/PNG -> BMP conversion used by both generateCoverBmp() (a
+  // fixed, well-known item) and generateImageBmp() (an arbitrary in-book
+  // image, cache-keyed by href hash since hrefs aren't valid filenames).
+  bool convertItemToBmp(const std::string& itemHref, const std::string& outputBmpPath, bool cropped) const;
 
  public:
   explicit Epub(std::string filepath, const std::string& cacheDir) : filepath(std::move(filepath)) {
@@ -54,6 +58,12 @@ class Epub {
   const std::string& getLanguage() const;
   std::string getCoverBmpPath(bool cropped = false) const;
   bool generateCoverBmp(bool cropped = false) const;
+  // Cache path/generator for an arbitrary in-book image (e.g. a CJK reader
+  // full-page image break), keyed by a hash of itemHref since hrefs contain
+  // '/' and aren't valid flat filenames. Same JPG/PNG support and
+  // already-cached short-circuit as generateCoverBmp().
+  std::string getImageBmpPath(const std::string& itemHref) const;
+  bool generateImageBmp(const std::string& itemHref) const;
   std::string getThumbBmpPath() const;
   std::string getThumbBmpPath(int height) const;
   bool generateThumbBmp(int height) const;
@@ -72,6 +82,18 @@ class Epub {
   int getTocIndexForSpineIndex(int spineIndex) const;
   size_t getCumulativeSpineItemSize(int spineIndex) const;
   int getSpineIndexForTextReference() const;
+  // True if the given spine index should be skipped during normal
+  // sequential reading (page-turning, resuming, or picking the opening
+  // chapter) rather than treated as a real chapter -- the EPUB3 nav
+  // document, or anything else the spine marks linear="no" (footnotes, a
+  // teaser page, etc.). Checks the spine's own linear="no" attribute first
+  // (the actual spec mechanism), then falls back to identifying the nav
+  // document specifically via the manifest's properties="nav" marker or a
+  // "nav.xhtml"/"nav.html" filename match, for books that omit linear="no"
+  // and the nav property alike. See getSpineIndexForTextReference()'s own
+  // reasoning for why this matters: a real spine item in some books, but
+  // its content is a link list, not a chapter.
+  bool isNonLinearSpineIndex(int spineIndex) const;
 
   size_t getBookSize() const;
   float calculateProgress(int currentSpineIndex, float currentSpineRead) const;

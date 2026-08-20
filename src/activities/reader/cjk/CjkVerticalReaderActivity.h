@@ -38,6 +38,27 @@ class CjkVerticalReaderActivity final : public Activity {
   SdCardFontRegistry fontRegistry;
   SdCardFontManager fontManager;
   int fontId = 0;
+  // A same-family font loaded one size tier up from fontId, used for
+  // <h1>-<h6> text (see CjkChapterText.h/CjkVerticalLayout.h's style
+  // sentinels) -- all six heading levels collapse to this one larger size,
+  // not six different sizes. 0 if the family has no larger size installed
+  // (falls back to fontId, i.e. headings just don't visually stand out --
+  // graceful, not a load failure). Loaded additively via
+  // loadFamilyExtraSize(), same mechanism SdCardFontSystem's own UI-fallback
+  // sizes use, so it doesn't disturb fontId's own slot.
+  int headingFontId = 0;
+  // A same-family font loaded at (the nearest available size to) the
+  // built-in status bar's SMALL_FONT_ID point size, registered via
+  // renderer.setFallbackFont(SMALL_FONT_ID, titleFallbackFontId) so
+  // GUI.drawStatusBar()'s book-title text can render CJK the same way the
+  // TOC's titles do. Unlike the TOC (many distinct chapter titles hammering
+  // SdCardFont's 8-slot on-demand overflow ring -- see standardFontUnloaded's
+  // sibling comment on why that swap isn't used for the whole session), this
+  // is a single, unchanging string re-prewarmed once in loadReaderFonts(), so
+  // keeping it registered for the full reading session is cheap and safe.
+  // 0 if the family has no size close enough on disk -- the title just shows
+  // boxes in the footer then, same graceful fallback headingFontId uses.
+  int titleFallbackFontId = 0;
   // True once sdFontSystem.unload() has been called this session, regardless
   // of whether the subsequent load of our own font then succeeded -- onExit()
   // uses this (not overall success) to decide whether the standard reader's
@@ -57,6 +78,19 @@ class CjkVerticalReaderActivity final : public Activity {
   // calls setupCacheDir()).
   std::string chapterTextPath;
   std::vector<size_t> pageIndex;  // byte offsets; pageIndex[i]..pageIndex[i+1] is page i
+  // Text level (0=normal, 1=heading -- see CjkVerticalLayout::styleFromSentinel)
+  // active at the start of each page, parallel to pageIndex (one entry per
+  // page, not per boundary). Lets renderPage() start a page already knowing
+  // whether it opens mid-heading, without rescanning from the chapter start.
+  std::vector<uint8_t> pageStartStyle;
+  // Per-page image state, parallel to pageIndex (one entry per page): -1
+  // for an ordinary text page, or an index into chapterImages for a page
+  // that's a dedicated full-page <img> break (see
+  // CjkVerticalLayout::buildPageIndex()'s outPageImageIndex parameter).
+  // chapterImages holds each image's resolved href, in extraction order --
+  // see CjkChapterText::ChapterTextExtractor::getImagePaths()'s comment.
+  std::vector<int> pageImageIndex;
+  std::vector<std::string> chapterImages;
   int currentPage = 0;
   // Set by loadChapter() on failure (href + byte size it was reading, or
   // "no href"/"not readable" for the failure before a read is even
@@ -85,8 +119,35 @@ class CjkVerticalReaderActivity final : public Activity {
   int columnWidthPx = 0;   // horizontal step per column
   CjkVerticalLayout::PageMetrics metrics{};
 
+  // Shown once per book open (see onEnter()), dismissed by any page-turn/
+  // confirm input in loop(). Reuses the same cover-generation/path
+  // machinery the file browser, home screen, and sleep screen already use
+  // (Epub::generateCoverBmp/getCoverBmpPath), not a new mechanism.
+  bool showingCover = false;
+  std::string coverBmpPath;
+
+  // Loads fontId and headingFontId from CJK_READER_SETTINGS.fontFamilyName
+  // together, as one unit -- both onEnter() and openChapterSelection()'s
+  // result handler need to (re)do this after unloading fonts for another
+  // purpose (the standard reader's SD font slot, or sdFontSystem's TOC
+  // fallback), and having two separate call sites each load "the fonts"
+  // by hand is exactly how headingFontId ended up forgotten in one of them
+  // on a real device: the TOC path only restored fontId, leaving
+  // headingFontId pointing at a font unloadAll() had already deleted, so
+  // headings silently stopped drawing for the rest of the session after
+  // the first TOC visit. Returns false (and sets loadFailed) only if the
+  // main reading font fails -- a missing heading size is not fatal (see
+  // headingFontId's own comment).
+  bool loadReaderFonts();
+
   bool loadChapter(int spineIndex);
   void renderPage() const;
+  void renderCoverPage() const;
+  // Shared by renderCoverPage() (a fixed, well-known bitmap) and the
+  // current page's image break, if any (an arbitrary in-book image at
+  // imageBmpPath) -- same centered scale-to-fit placement and 3-pass
+  // grayscale rendering sequence either way.
+  void renderFullPageBitmap(const std::string& bmpPath) const;
   void renderStatusBar() const;
   void openChapterSelection();
 
