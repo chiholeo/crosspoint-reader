@@ -36,6 +36,25 @@ void getVerticalPunctuationOffset(uint32_t cp, uint16_t glyphW, uint16_t glyphH,
 // (GfxRenderer::drawTextRotated90CW), not an offset.
 bool isRotatedPunctuation(uint32_t cp);
 
+// True for the subset of isRotatedPunctuation() whose ink already sits
+// centered within its own bitmap box by design (em dash, horizontal bar,
+// ellipsis -- a line/dots drawn symmetrically, unlike a bracket's
+// asymmetric curve), so GfxRenderer::drawGlyphRotated90CCW's centered=true
+// option is correct for them specifically. See that function's own comment
+// for why centering isn't the default for every rotated glyph.
+bool isCenteredRotation(uint32_t cp);
+
+// Maps a subset of isRotatedPunctuation()'s codepoints to their Unicode
+// "Vertical Forms" (U+FE30-FE4F) equivalent -- glyphs a CJK font can draw
+// purpose-built for vertical use, upright, no rotation needed at all. Not
+// every rotated codepoint has one: square brackets, curly quotes, and
+// ellipsis have no standard vertical-form equivalent, so they always
+// return 0 and stay on the rotation path. Callers must still confirm the
+// loaded font actually has a glyph at the returned codepoint before using
+// it -- this table doesn't know which fonts were converted with that range
+// included.
+uint32_t verticalFormFor(uint32_t cp);
+
 // Given a column's codepoints (in reading order) and the maximum codepoints
 // that fit in one column, returns how many codepoints actually belong in
 // this column once kinsoku rules are applied — walking the break point back

@@ -2080,7 +2080,8 @@ void GfxRenderer::drawTextRotated90CW(const int fontId, const int x, const int y
 }
 
 void GfxRenderer::drawGlyphRotated90CCW(const int fontId, const uint32_t codepoint, const int cellX, const int cellY,
-                                        const int cellSize, const bool black, const EpdFontFamily::Style style) const {
+                                        const int cellSize, const bool black, const EpdFontFamily::Style style,
+                                        const bool centered) const {
   // Single-glyph counterpart to drawTextRotated90CW, for callers placing one
   // already-positioned character at a time (e.g. the CJK vertical reader's
   // per-glyph column layout) rather than a laid-out run -- no advance,
@@ -2096,17 +2097,29 @@ void GfxRenderer::drawGlyphRotated90CCW(const int fontId, const uint32_t codepoi
   }
   const auto& font = fontIt->second;
 
-  // Plain top-left anchor (cellX, cellY) -- NOT centered on the glyph's own
-  // ink bounding box. An earlier attempt centered on (glyph->height,
-  // glyph->width) on the theory that CJK punctuation typically has much
-  // less ink than its advance box; on-device testing showed the opposite of
-  // what that theory predicted -- top-left anchoring was already correct
-  // for nearly every rotated glyph, and centering shifted all of them
-  // except U+300C ("「") to the right. So top-left is the real default;
-  // U+300C specifically still reads shifted under it and may need its own
-  // small correction once there's a reliable way to verify one on-device.
-  (void)cellSize;
-  renderCharImpl<TextRotation::Rotated90CCW>(*this, renderMode, font, codepoint, cellX, cellY, black, style);
+  // Default: plain top-left anchor (cellX, cellY) -- NOT centered on the
+  // glyph's own ink bounding box. An earlier attempt centered every
+  // rotated glyph on (glyph->height, glyph->width) on the theory that CJK
+  // punctuation typically has much less ink than its advance box;
+  // on-device testing showed the opposite of what that theory predicted --
+  // top-left anchoring was already correct for nearly every rotated glyph
+  // (mostly bracket/quote shapes, whose ink sits asymmetrically within
+  // their bitmap box), and centering shifted all of them except U+300C
+  // ("「") to the right. See the header's own comment: centered=true opts
+  // back in for glyphs where that assumption doesn't hold (e.g. em dash /
+  // ellipsis, whose ink is already centered within its own bitmap box).
+  int x = cellX;
+  int y = cellY;
+  if (centered) {
+    const EpdGlyph* glyph = font.getGlyph(codepoint, style);
+    if (glyph) {
+      // Rotated bounding box is (glyph->height x glyph->width) -- see
+      // renderCharImpl's own Rotated90CCW strip-culling comment for why.
+      x = cellX + (cellSize - static_cast<int>(glyph->height)) / 2;
+      y = cellY + (cellSize - static_cast<int>(glyph->width)) / 2;
+    }
+  }
+  renderCharImpl<TextRotation::Rotated90CCW>(*this, renderMode, font, codepoint, x, y, black, style);
 }
 
 uint8_t* GfxRenderer::getFrameBuffer() const { return frameBuffer; }

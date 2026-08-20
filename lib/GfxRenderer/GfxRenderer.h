@@ -277,12 +277,18 @@ class GfxRenderer {
   // GfxRenderer.cpp for why drawTextRotated90CW's actual pixel math is the
   // other direction despite its name). (cellX, cellY, cellSize) is the
   // fixed-size square cell the caller has allotted this character (matching
-  // its column-layout step); the glyph's rotated ink is centered within it
-  // rather than anchored at the raw top-left, since CJK punctuation glyphs
-  // often have much less ink than their advance box and a top-left anchor
-  // left a visible, glyph-dependent gap before the next character.
+  // its column-layout step). Default is a plain top-left anchor at
+  // (cellX, cellY), not centered on the glyph's ink: on-device testing
+  // found that was already correct for nearly every rotated glyph (mostly
+  // bracket/quote shapes with asymmetric ink within their bitmap box, where
+  // box-centering visibly disagreed with correct-looking placement) --
+  // see GfxRenderer.cpp's own comment on that finding. centered=true opts a
+  // specific glyph back into centering on (glyph->height, glyph->width)
+  // within the cell, for shapes where that assumption doesn't hold (e.g.
+  // em dash / ellipsis, whose ink already sits centered within their own
+  // bitmap box by design, unlike a bracket's curve).
   void drawGlyphRotated90CCW(int fontId, uint32_t codepoint, int cellX, int cellY, int cellSize, bool black = true,
-                             EpdFontFamily::Style style = EpdFontFamily::REGULAR) const;
+                             EpdFontFamily::Style style = EpdFontFamily::REGULAR, bool centered = false) const;
   int getTextHeight(int fontId) const;
 
   // Grayscale functions

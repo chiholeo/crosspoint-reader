@@ -38,6 +38,46 @@ constexpr uint32_t kRotatedPunctuation[] = {
     0x3008, 0x3009,  // 〈 〉 single angle brackets
     0x2018, 0x2019,  // ‘ ’ curly single quotes
     0x201C, 0x201D,  // “ ” curly double quotes
+    0x2014, 0x2015,  // — ― em dash / horizontal bar -- reads as a horizontal
+                     // line in a vertical column no matter how it's nudged;
+                     // convention rotates it to read as a vertical line.
+                     // Chinese text commonly doubles it ("——"), which just
+                     // means two consecutive rotated glyphs here.
+    0x2026,          // … horizontal ellipsis -- same reasoning: reads
+                     // sideways unrotated, rotates to a vertical row of dots.
+};
+
+// Subset of kRotatedPunctuation whose ink sits centered within its own
+// bitmap box by design -- see isCenteredRotation()'s declaration.
+constexpr uint32_t kCenteredRotation[] = {
+    0x2014, 0x2015, 0x2026,
+};
+
+// Horizontal codepoint -> Unicode Vertical Forms (U+FE30-FE4F) equivalent.
+// Both ASCII and fullwidth parens map to the same fullwidth vertical-paren
+// glyph -- there's no separate "narrow" vertical form, and the rotation
+// path already treats them identically. Deliberately omits: square brackets
+// (no vertical form exists), curly quotes (none exists), 0x2015/ellipsis
+// (already validated correct via centered rotation, and no vertical form
+// exists for either) -- see verticalFormFor()'s own declaration.
+struct VerticalFormEntry {
+  uint32_t from;
+  uint32_t to;
+};
+constexpr VerticalFormEntry kVerticalForms[] = {
+    {0x300C, 0xFE41},  // 「 -> vertical left corner bracket
+    {0x300D, 0xFE42},  // 」 -> vertical right corner bracket
+    {0x300E, 0xFE43},  // 『 -> vertical left white corner bracket
+    {0x300F, 0xFE44},  // 』 -> vertical right white corner bracket
+    {0xFF08, 0xFE35},  // （ -> vertical left paren
+    {0xFF09, 0xFE36},  // ） -> vertical right paren
+    {0x0028, 0xFE35},  // (  -> vertical left paren (same glyph as fullwidth)
+    {0x0029, 0xFE36},  // )  -> vertical right paren
+    {0x300A, 0xFE3D},  // 《 -> vertical left double angle bracket
+    {0x300B, 0xFE3E},  // 》 -> vertical right double angle bracket
+    {0x3008, 0xFE3F},  // 〈 -> vertical left angle bracket
+    {0x3009, 0xFE40},  // 〉 -> vertical right angle bracket
+    {0x2014, 0xFE31},  // — -> vertical em dash
 };
 
 bool contains(const uint32_t* values, const size_t count, const uint32_t cp) {
@@ -77,6 +117,17 @@ void getVerticalPunctuationOffset(const uint32_t cp, const uint16_t glyphW, cons
 
 bool isRotatedPunctuation(const uint32_t cp) {
   return contains(kRotatedPunctuation, sizeof(kRotatedPunctuation) / sizeof(kRotatedPunctuation[0]), cp);
+}
+
+bool isCenteredRotation(const uint32_t cp) {
+  return contains(kCenteredRotation, sizeof(kCenteredRotation) / sizeof(kCenteredRotation[0]), cp);
+}
+
+uint32_t verticalFormFor(const uint32_t cp) {
+  for (const auto& entry : kVerticalForms) {
+    if (entry.from == cp) return entry.to;
+  }
+  return 0;
 }
 
 uint8_t chooseLineBreak(const uint32_t* lineCodepoints, const uint8_t count, const uint16_t maxColumns) {
