@@ -701,7 +701,14 @@ void CrossPointWebServer::handleUpload(UploadState& state) const {
     }
 
     LOG_DBG("WEB", "[UPLOAD] START: %s to path: %s", state.fileName.c_str(), state.path.c_str());
-    LOG_DBG("WEB", "[UPLOAD] Free heap: %d bytes", ESP.getFreeHeap());
+    // max-alloc, not just free heap: a healthy free-heap total can still
+    // fail an allocation if it's fragmented into pieces smaller than what's
+    // actually needed. This is the "critical 1% crash point" noted above --
+    // logging both here means a report from the *next* occurrence of that
+    // crash can actually distinguish "genuinely out of memory" from
+    // "enough memory, just not contiguous" instead of leaving it a guess.
+    LOG_DBG("WEB", "[UPLOAD] Free heap: %d bytes, max-alloc: %d bytes", ESP.getFreeHeap(),
+            ESP.getMaxAllocHeap());
 
     String filePath = state.path;
     if (!filePath.endsWith("/")) filePath += "/";
