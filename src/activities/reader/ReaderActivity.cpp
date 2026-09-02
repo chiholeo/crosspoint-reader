@@ -118,14 +118,8 @@ void ReaderActivity::goToLibrary(const std::string& fromBookPath) {
   activityManager.goToFileBrowser(std::move(initialPath));
 }
 
-void ReaderActivity::onGoToEpubReader(std::unique_ptr<Epub> epub) {
-  const auto epubPath = epub->getPath();
-  currentBookPath = epubPath;
-  // Opt-in CJK vertical reader: only takes over when explicitly enabled AND
-  // a font family is configured (there's no built-in CJK font to fall back
-  // on). Any other state -- disabled, or enabled with no font picked yet --
-  // falls through to the standard EpubReaderActivity untouched.
-  if (CJK_READER_SETTINGS.enabled && !CJK_READER_SETTINGS.fontFamilyName.empty()) {
+void ReaderActivity::openEpubWithChoice(std::unique_ptr<Epub> epub, const Epub::ReaderChoice choice) {
+  if (choice == Epub::ReaderChoice::Cjk) {
     activityManager.replaceActivity(std::make_unique<CjkVerticalReaderActivity>(renderer, mappedInput,
                                                                                 std::move(epub),
                                                                                 initialRefreshCountdown()));
@@ -133,6 +127,39 @@ void ReaderActivity::onGoToEpubReader(std::unique_ptr<Epub> epub) {
   }
   activityManager.replaceActivity(
       std::make_unique<EpubReaderActivity>(renderer, mappedInput, std::move(epub), initialRefreshCountdown()));
+}
+
+void ReaderActivity::onGoToEpubReader(std::unique_ptr<Epub> epub) {
+  const auto epubPath = epub->getPath();
+  currentBookPath = epubPath;
+
+  // The CJK reader is only a real choice when explicitly enabled AND a font family is
+  // configured (there's no built-in CJK font to fall back on). Any other state -- disabled,
+  // or enabled with no font picked yet -- means there's nothing to ask: always Default,
+  // exactly as before this per-book chooser existed.
+  if (!(CJK_READER_SETTINGS.enabled && !CJK_READER_SETTINGS.fontFamilyName.empty())) {
+    openEpubWithChoice(std::move(epub), Epub::ReaderChoice::Default);
+    return;
+  }
+
+  const Epub::ReaderChoice saved = epub->getSavedReaderChoice();
+  if (saved != Epub::ReaderChoice::Unset) {
+    openEpubWithChoice(std::move(epub), saved);
+    return;
+  }
+
+  // First time this particular book has been opened with the CJK reader available: ask once,
+  // then remember the answer in the book's own cache dir so it never needs asking again.
+  pendingEpub = std::move(epub);
+  static constexpr StrId options[] = {StrId::STR_READER_DEFAULT, StrId::STR_READER_CJK_VERTICAL};
+  readerChoicePopup.show(StrId::STR_CHOOSE_READER_TITLE, options, 2, 0, [this](const int idx) {
+    auto chosenEpub = std::move(pendingEpub);
+    if (!chosenEpub) return;
+    const auto choice = idx == 1 ? Epub::ReaderChoice::Cjk : Epub::ReaderChoice::Default;
+    chosenEpub->saveReaderChoice(choice);
+    openEpubWithChoice(std::move(chosenEpub), choice);
+  });
+  requestUpdate();
 }
 
 void ReaderActivity::onGoToBmpViewer(const std::string& path) {
@@ -191,3 +218,32 @@ void ReaderActivity::onEnter() {
 }
 
 void ReaderActivity::onGoBack() { finish(); }
+
+void ReaderActivity::loop() {
+  if (readerChoicePopup.handleInput(mappedInput, [this] { requestUpdate(); })) {
+    // handleInput() returns true both when an option was picked (onSelect already ran and
+    // consumed pendingEpub) and when the popup was merely dismissed -- physical Back, or a tap
+    // outside the dialog -- with no callback fired. In the latter case pendingEpub is still
+    // set: without bailing out here, the reader would sit on a frozen screen forever, since
+    // loop() has nothing else to check once the popup goes inactive.
+    if (!readerChoicePopup.isActive() && pendingEpub) {
+      pendingEpub.reset();
+      onGoBack();
+    }
+    return;
+  }
+}
+
+void ReaderActivity::render(RenderLock&&) {
+  if (!readerChoicePopup.isActive()) return;
+
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const auto pageWidth = renderer.getScreenWidth();
+
+  renderer.clearScreen();
+  GUI.drawHeader(renderer, Rect{0, metrics.topPadding, pageWidth, metrics.headerHeight},
+                 pendingEpub ? pendingEpub->getTitle().c_str() : "");
+
+  if (readerChoicePopup.processRender(renderer, mappedInput)) return;
+  renderer.displayBuffer();
+}

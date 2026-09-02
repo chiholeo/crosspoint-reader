@@ -42,6 +42,12 @@ class Epub {
   bool convertItemToBmp(const std::string& itemHref, const std::string& outputBmpPath, bool cropped) const;
 
  public:
+  // Per-book choice of which reader activity to open the EPUB in, cached on
+  // disk so ReaderActivity only has to prompt the user once per book (see
+  // getSavedReaderChoice()/saveReaderChoice()). Unset means "never asked, or
+  // the cache was cleared" -- ReaderActivity prompts again in that case.
+  enum class ReaderChoice : uint8_t { Unset = 0, Default = 1, Cjk = 2 };
+
   explicit Epub(std::string filepath, const std::string& cacheDir) : filepath(std::move(filepath)) {
     // create a cache key based on the filepath
     cachePath = cacheDir + "/epub_" + std::to_string(std::hash<std::string>{}(this->filepath));
@@ -94,6 +100,13 @@ class Epub {
   // reasoning for why this matters: a real spine item in some books, but
   // its content is a link list, not a chapter.
   bool isNonLinearSpineIndex(int spineIndex) const;
+
+  // Reader-choice cache -- see the ReaderChoice enum above. Cleared along
+  // with the rest of this book's cache by clearCache() / "Clear Reading
+  // Cache" in Settings, which doubles as the way to make ReaderActivity ask
+  // again for a book that was answered before.
+  ReaderChoice getSavedReaderChoice() const;
+  void saveReaderChoice(ReaderChoice choice) const;
 
   size_t getBookSize() const;
   float calculateProgress(int currentSpineIndex, float currentSpineRead) const;

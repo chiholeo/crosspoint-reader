@@ -1,10 +1,11 @@
 #pragma once
 #include <memory>
 
+#include "Epub.h"
 #include "activities/Activity.h"
 #include "activities/home/FileBrowserActivity.h"
+#include "components/OptionPopup.h"
 
-class Epub;
 class Xtc;
 class Txt;
 
@@ -29,6 +30,21 @@ class ReaderActivity final : public Activity {
   void onGoBack();
   int initialRefreshCountdown() const;
 
+  // Per-book override of which reader engine to use, letting a mixed English/CJK library use
+  // the right reader per book instead of one global CJK-reader-enabled setting for every EPUB.
+  // The choice itself is persisted via Epub::getSavedReaderChoice()/saveReaderChoice(), in the
+  // book's own cache directory -- survives independently of RecentBooksStore's recency-limited
+  // list, so it still applies after a book falls out of "recent" and is reopened via the file
+  // browser much later, and only needs asking once per book.
+  //
+  // pendingEpub is held across loop()/render() calls while readerChoicePopup is up deciding
+  // which reader to use -- onGoToEpubReader() can't finish the dispatch synchronously in that
+  // case the way it does when there's nothing to ask (CJK reader not viable, or a choice
+  // already saved).
+  std::unique_ptr<Epub> pendingEpub;
+  OptionPopup readerChoicePopup;
+  void openEpubWithChoice(std::unique_ptr<Epub> epub, Epub::ReaderChoice choice);
+
  public:
   explicit ReaderActivity(GfxRenderer& renderer, MappedInputManager& mappedInput, std::string initialBookPath,
                           bool allowFastInitialRefresh)
@@ -36,5 +52,7 @@ class ReaderActivity final : public Activity {
         initialBookPath(std::move(initialBookPath)),
         allowFastInitialRefresh(allowFastInitialRefresh) {}
   void onEnter() override;
+  void loop() override;
+  void render(RenderLock&&) override;
   bool isReaderActivity() const override { return true; }
 };

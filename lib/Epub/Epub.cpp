@@ -577,6 +577,20 @@ const std::string& Epub::getLanguage() const {
   return bookMetadataCache->coreMetadata.language;
 }
 
+Epub::ReaderChoice Epub::getSavedReaderChoice() const {
+  const std::string path = cachePath + "/reader_choice.bin";
+  if (!Storage.exists(path.c_str())) return ReaderChoice::Unset;
+  const String content = Storage.readFile(path.c_str());
+  if (content.length() == 1 && content[0] == '2') return ReaderChoice::Cjk;
+  if (content.length() == 1 && content[0] == '1') return ReaderChoice::Default;
+  return ReaderChoice::Unset;
+}
+
+void Epub::saveReaderChoice(const ReaderChoice choice) const {
+  const std::string path = cachePath + "/reader_choice.bin";
+  Storage.writeFile(path.c_str(), String(choice == ReaderChoice::Cjk ? "2" : "1"));
+}
+
 std::string Epub::getCoverBmpPath(bool cropped) const {
   const auto coverFileName = std::string("cover") + (cropped ? "_crop" : "");
   return cachePath + "/" + coverFileName + ".bmp";
